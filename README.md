@@ -2,81 +2,64 @@
 
 > **AI changed creation. Kaitoi changes production.**
 
-This plugin brings Kaitoi's video models into the DaVinci Resolve timeline. Park the playhead on a clip, open the panel, describe the change, press **Generate**. The clip's exact range is exported, sent through a Kaitoi model, and the result lands on a new track above the original — graded, trimmed, effects and all, without leaving Resolve.
+This plugin puts your Kaitoi workflows and Kaitoi's nodes inside DaVinci Resolve. Pick a clip, pick a workflow or a node, press **Generate**. What the clip plays, with its trims, grade and effects, is sent to Kaitoi, and the result comes back onto a new track above the original. Your cut is never changed.
+
+A workflow or node can also live in Resolve's Effects Library as an effect of its own, with its inputs as real controls in the Inspector. You then run it from the Inspector, like any other effect.
 
 ---
 
 ## What you can do
 
-### Restyle or edit a clip (Video → Video)
-
-The clip itself goes to the model. Motion is preserved; look, subject or style change with the prompt.
-
-| Model | Kaitoi node | In the panel |
-|---|---|---|
-| Ray 3.2 Video Edit | `builtin/third_party/fal/ray35_v2v` | Ray35 |
-| Lucy Edit Fast | `builtin/third_party/fal/lucy_edit_fast` | Lucy Edit Fast |
-| Kling O3 Standard v2v Edit | `builtin/third_party/fal/kling_o3_standard_v2v_edit` | Kling O3 Edit |
-| LTX 2 Video-to-Video | `builtin/third_party/fal/ltx_2_19b_video_to_video` | Ltx2 V2V |
-| Render to Real | `builtin/third_party/fal/ltx_render_to_real` | Render To Real |
-| Luma Ray 3 Modify Video | `builtin/third_party/lumalabs/ray3_modify_video` | Ray3 Modify |
-| Video Reverse & Speed (free, local) | `builtin/video/video_reverse` | Reverse Selftest |
-
-### Generate a new shot from a frame (Image → Video)
-
-The clip's first frame seeds a freshly generated shot.
-
-| Model | Kaitoi node | In the panel |
-|---|---|---|
-| Seedance 2.0 i2v | `builtin/third_party/fal/seedance_2_i2v` | Seedance2 |
-| Hailuo 2.3 Fast Pro | `builtin/third_party/fal/hailuo_23_fast_pro` | Hailuo 23 |
-| Kling Video O3 Standard i2v | `builtin/third_party/fal/kling_o3_standard_i2v` | Kling O3 I2V |
-| LTX Video 2.3 Pro | `builtin/third_party/fal/ltx_video_23_pro` | Ltx23 Pro |
-| Google Veo 3.1 Fast i2v | `builtin/third_party/fal/google_veo31_fast_i2v` | Veo31 Fast |
-| Luma Ray 3 | `builtin/third_party/lumalabs/ray3_video` | Ray3 |
-
-The **Model** dropdown labels each preset by its key and the node's short name (`Ray35   (ray35_v2v)`), so the node column is what to match on.
-
-Any other Kaitoi node type with a video or image input and a prompt works too: presets are one line each in [`graphs.py`](kaitoi_resolve/graphs.py), and the graph is wired from the node's live schema, not hard-coded pin names.
-
-### Keep the cut intact
-
-- **New Kaitoi track above the clip** (default): the result sits at the same record frame on a `Kaitoi N` track, in a `Kaitoi` media-pool bin. Toggle the track to compare; the source clip is never touched.
-- **Append to the end** of the timeline, or **media pool only**.
-- **History**: the last 50 generations, with prompt, model and file; re-open or re-import any of them.
-- **Cancel** stops the export, the polling or the remote run within about a second.
-
-### One key, every Kaitoi plugin
-
-The API key is stored once in `~/.kaitoi/credentials.json` and shared with the other Kaitoi plugins (SketchUp, …).
+- **Run your own workflows.** Every template in your Kaitoi account that has an API endpoint is listed under **Workflows**, with its inputs. Build or change one in Kaitoi Studio and it shows up here; the plugin does not need updating.
+- **Run single nodes.** **Nodes** lists Kaitoi's catalog: built-in nodes, community nodes and your own. Video models, image models, upscalers, audio tools and the rest.
+- **Run from the Inspector.** **Use this workflow** or **Use this node** adds the tool to the selected clip as an effect. Its inputs appear in the Inspector under Effects, with **Generate**, **Cancel** and a status line.
+- **Or run from the Kaitoi window.** **Run from this window** opens a form for the same inputs, with progress, without adding anything to the clip.
+- **Keep the cut intact.** A result goes on a `Kaitoi` track at the same place as its source, and into a `Kaitoi` bin in the media pool. Switch the track off to compare. You can also send results to the end of the timeline, or to the media pool only.
+- **Find things again.** Search, filter by category or task, mark favorites, and reopen any earlier result from **History**.
 
 ---
 
-## Why it works this way
+## How it fits into Resolve
 
-**The timeline stays the source of truth.** What gets sent is the clip as it plays — trims, grade, Fusion effects, everything above it — rendered from the Deliver page. What comes back is placed non-destructively, so iterating is a matter of picking another model or prompt and pressing Generate again on the new track.
+A few ideas explain most of what the plugin does.
 
-**Any Kaitoi model can be wired in.** The plugin reads each node's published schema at run time and connects the loader's output to the model's first video or image input, and the prompt to its prompt pin. Adding a model is a one-line preset, no pin names to learn.
+**What gets sent.** The plugin looks at the timeline in this order: the In/Out range if both marks are set, then the selected clip, then the clip under the playhead. A tool that takes a video gets that range as a small video. A tool that takes an image gets the frame under the playhead. A tool that takes audio gets the sound of the range. So one video clip can feed all three kinds of tool. With nothing selected, a tool that creates from nothing can still place its result at the playhead.
 
-**It is a Kaitoi workflow, not a one-off API call.** Every generation is an inline Kaitoi graph: loader → prompt → model. Point the plugin at a saved Studio project instead (`template_project_id`) and the same panel drives a pipeline you designed visually.
+**Effect, generator or window.** Resolve only draws controls in the Inspector for effects it knows, so the plugin writes one small settings file per tool into your own Effects Library, in a folder called Kaitoi:
+
+- An **effect**, for a tool that takes a clip or a frame. It sits on your clip, which is not moved or cut.
+- A **generator**, for every tool. Laid on a track above a shot, it runs on what plays beneath it, or creates something new in its place.
+- The **window** runs the same tool with the same inputs, and adds nothing to the timeline until the result arrives.
+
+Resolve reads its effects when it starts. A tool you have just installed can be dragged in as a generator at once, but it can only be added to clips as an effect after you restart Resolve once. The window tells you when tools are waiting for a restart. Your workflows are installed for you each time the window loads them.
+
+**Not every node suits Resolve.** The Nodes list can show everything in Kaitoi, but Resolve can only place pictures, video and sound. With **Works in Resolve** ticked, the list leaves out nodes whose result is something else, nodes that need you to work in a web page of their own, session nodes, agent nodes, and nodes that require an input the plugin cannot supply, such as a 3D model.
+
+**More than one input.** The timeline supplies the main clip, frame or sound. Any other file a tool needs, such as a style image, has a file picker in the form and in the Inspector.
+
+**Results that differ from the source.** Models return what they return: often a fixed length, often 720p, often 24 or 30 frames a second. The result is still placed, and a note tells you what differs, so you know before it reaches a client.
 
 ---
 
 ## Quick start
 
-**1. Get a Kaitoi Studio account** at [studio.kaitoi.io](https://studio.kaitoi.io) and create an API key (files and runs read/write scopes; `account_credits:read` is optional).
+**1. Get a Kaitoi Studio account** at [studio.kaitoi.io](https://studio.kaitoi.io).
 
 **2. Install the plugin.**
 
+*With the macOS installer.* Download `Kaitoi-for-DaVinci-Resolve-<version>.pkg` from the [latest release](https://github.com/kaitoi-labs/kaitoi-davinci/releases/latest) and open it. It is signed and notarized by Kaitoi Labs. It installs Kaitoi for the person who runs it: each person on a shared Mac who wants Kaitoi in Resolve runs it once. If it cannot add the files to your Resolve folder, it says why in the installer log and leaves a `README.txt` beside the files with the steps to do it by hand.
+
+*From this repository*, on macOS, Linux or Windows (Git Bash):
+
 ```bash
-git clone https://github.com/kaitoi-labs/kaitoi_Davinci.git
-cd kaitoi_Davinci
-./install.sh              # symlink into Resolve's Scripts/Edit folder
+git clone https://github.com/kaitoi-labs/kaitoi-davinci.git
+cd kaitoi-davinci
+./install.sh              # link the script into Resolve's Scripts/Edit folder
 ./install.sh --copy       # or copy the files instead
 ./install.sh --uninstall  # remove it again
 ```
 
-The launcher goes into the per-user scripts folder:
+The script goes into your own scripts folder:
 
 | OS | Folder |
 |---|---|
@@ -84,75 +67,96 @@ The launcher goes into the per-user scripts folder:
 | Linux | `~/.local/share/DaVinciResolve/Fusion/Scripts/Edit/` |
 | Windows | `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Edit\` |
 
-**3. Restart Resolve**, open a timeline, park the playhead on a clip, and run **Workspace → Scripts → Edit → Kaitoi Video**.
+**3. Restart Resolve**, open a timeline, and choose **Workspace > Scripts > Edit > Kaitoi**.
 
-**4. Paste your API key** in the **Settings** tab, **Save**, **Test connection**.
+**4. Sign in.** On the **Account** tab press **Sign in with Kaitoi** and sign in in your browser. The plugin gets a key of its own, named for this computer and listed with your other keys in Kaitoi Studio, where you can revoke it. It stops working by itself after 30 days. Signing in again here replaces this computer's earlier key; **Sign out** forgets the key on this computer and takes your workflows out of Resolve's Effects Library. On a server that does not offer this yet, or if you prefer, paste an API key from Kaitoi Studio instead (files and runs read/write scopes; `account_credits:read` is optional), then **Save** and **Test connection**.
 
-**5. Verify.** Pick **Reverse Selftest** as the model, type any prompt, **Generate**. It runs a free local node and puts the reversed clip on a new track — the whole path, no credits spent.
+**5. Run something.** Select a clip. On **Nodes**, tick **Works in Resolve**, pick a node, and press **Run from this window**, then **Generate**. The result lands on a Kaitoi track above your clip.
 
 ### From a terminal
 
-The same launcher drives a running Resolve from a shell, handy while developing:
+The same script drives a running Resolve from a shell, which is handy while developing:
 
 ```bash
-python3 "Kaitoi Video.py"           # open the panel
-python3 "Kaitoi Video.py" --check   # print the clip under the playhead and exit
+python3 Kaitoi.py           # open the window
+python3 Kaitoi.py --check   # print what the timeline selection is, and exit
 ```
 
 ---
 
 ## Example usage
 
-**"Make it rain."**
-> Video → Video, Ray 3.2 Video Edit. Prompt: *"same shot at night in heavy rain, wet asphalt reflections, keep the camera move"*
+**Restyle a shot from the Inspector.**
+> Select the clip. On **Nodes**, pick a video-to-video model and press **Use this node**. In the Inspector, open Effects, type the prompt and press **Generate**.
 
-The clip is exported at 720p, uploaded, run, and the edit lands on `Kaitoi 2` at the same frame. Toggle the track to compare.
+The clip's range is rendered small, uploaded and run, and the result is placed on a Kaitoi track at the same frame. Switch the track off and on to compare.
 
-**"Turn this frame into a shot."**
-> Image → Video, Seedance 2.0. Prompt: *"a cat jumps into the lake, slow motion, golden hour"*
+**Turn a frame into a shot.**
+> Park the playhead on the frame. Pick an image-to-video model, press **Run from this window**, type the prompt and press **Generate**.
 
-The first frame of the clip seeds a new shot, placed above the original.
+The frame under the playhead seeds a new shot, placed above the original.
 
-**"Iterate."**
-> Leave the playhead where it is and Generate again with another prompt or model.
+**Run a pipeline you built in Studio.**
+> Publish the template with an API endpoint in Kaitoi Studio. Press **Reload** on **Workflows**, pick it, and press **Use this workflow**.
 
-The topmost Kaitoi track is what the viewer shows, so it is what gets picked up next — each pass builds on the last.
+Its inputs appear in the Inspector as text boxes, sliders, dropdowns, checkboxes and file pickers.
 
----
+**Iterate.**
+> Leave the playhead where it is and press **Generate** again with another prompt.
 
-## The panel
-
-Three tabs: **Generate**, **History**, **Settings**.
-
-**Generate** — Clip (topmost enabled video item under the playhead, with **Refresh**), Mode, Model, Prompt, Place, and *Send original media instead of rendering the clip range* (skips the export and uploads the source file as-is: fast, but ignores trims, grade and effects). While a job runs, the status bar shows the current step and the elapsed time, **Cancel** is enabled, and a stage strip tracks progress:
-
-```
-✓ Export   ›   ✓ Upload   ›   ◐ Graph   ›   ○ Run   ›   ○ Download   ›   ○ Place
-```
-
-**History** — one row per finished run. *Open selected* plays the file; *Re-import to timeline* places it again under the current playhead clip; *Clear* empties the list (files on disk are kept).
-
-**Settings** — API key, API base URL, work folder, export max height, export quality, run timeout, poll interval. *Test connection* reads the credit balance; *Open Studio* opens the web app.
+The topmost Kaitoi track is what the viewer shows, so it is what gets picked up next. Each pass builds on the last.
 
 ---
 
-## How a generation runs
+## The window
+
+A narrow window made to sit beside the Inspector. Resolve does not let a script dock a window, so it floats, stays on top, and remembers where you left it. Four tabs: **Workflows**, **Nodes**, **History**, **Account**.
+
+**Workflows** and **Nodes** share one layout: a search box, a **Show** filter (by task for workflows, by category for nodes), the list, and a card for the tool you picked. A line by the list says how many tools the filters leave.
+
+- **Only what fits the timeline selection** lists only tools the current selection can feed.
+- **Works in Resolve** lists only tools whose results Resolve can place.
+- **Favorites only** lists the tools you marked with **Favorite** on their card.
+- **Installed only**, and on Nodes the **Built-in**, **Community** and **User** switches, narrow the list further.
+- On the card: **Use this workflow** or **Use this node**, **Run from this window**, and **Install in Resolve** or **Remove from Resolve**. On Nodes, **Install all** installs every listed node that is not installed yet.
+
+**Running from the window.** The form shows what will be sent from the timeline, with **Refresh**, then the tool's inputs, **Generate** and **Cancel**. A bar and a strip show progress through the six steps:
 
 ```
-timeline clip ──1. export──▶ ~/Movies/Kaitoi/kaitoi_src_*.mp4|png
-              ──2. upload──▶ POST /files/uploads → PUT signed URL → …/complete
-              ──3. graph ───▶ GET /node-types/{loader, text_prompt, model}
-              ──4. run ─────▶ POST /runs (inline graph + inputOverrides) → poll
-              ──5. import ──▶ download → media pool "Kaitoi" bin → track "Kaitoi N"
+Export   ›   Upload   ›   Prepare   ›   Run   ›   Download   ›   Place
 ```
 
-1. **Export** — a Deliver-page render of exactly the clip's record range (single-clip mode, video only, scaled to `export_max_height`, H.264 MP4; a PNG of the first frame for Image → Video). The Deliver page is restored afterwards.
-2. **Upload** — direct-to-storage session; no size cap, multipart handled.
-3. **Graph** — built from each node's live schema; every unwired input gets its catalog default.
-4. **Run** — inline graph with the uploaded file bound through `inputOverrides`, polled until terminal.
-5. **Import** — the result goes into the media pool and onto the timeline.
+**Cancel** stops the export, the waiting or the run on Kaitoi. **Open result** opens the finished file.
 
-Threading: Resolve is only ever called from the script's main thread. The panel pumps its own loop (`UIDispatcher.StepLoop()` every 50 ms): each pass dispatches clicks, advances the export, repaints the stage strip and yields to the worker thread that does the network steps (2–4).
+**History** has one row per finished run. **Open file** opens the result, **Place again** puts it back on the timeline, **Clear** empties the list and keeps the files.
+
+**Account** holds the sign-in and your credit balance, then:
+
+- *What gets sent*: **Max height** and **Quality** of the video that is uploaded, and **Send clips with their sound**.
+- *Results*: **Place on** (a Kaitoi track at the source, the end of the timeline, or the media pool only), **Work folder**, **Give up after (s)**, and **Put a result clip's sound on its own audio track**.
+- *In Resolve*: how many tools are in your Effects Library, and **Remove everything Kaitoi installed**.
+- *Window*: **Follow what is selected on the timeline** and **Stay on top**.
+
+---
+
+## How a run goes
+
+```
+timeline ──1. export────▶ a small video, a still or a sound file in the work folder
+         ──2. upload────▶ straight to Kaitoi's storage
+         ──3. prepare───▶ the workflow's endpoint, or a small graph around one node
+         ──4. run───────▶ started on Kaitoi and followed until it ends
+         ──5. download──▶ every file the run returned
+         ──6. place─────▶ media pool "Kaitoi" bin, then a "Kaitoi N" track
+```
+
+1. **Export.** A Deliver-page render of exactly the range, scaled down to **Max height**, H.264 in MP4; a still for a tool that takes an image; the sound alone for a tool that takes audio. Every project setting the export touches is put back afterwards.
+2. **Upload.** The file goes directly to storage, in parts when it is large.
+3. **Prepare.** A workflow is called through its endpoint. A single node has no endpoint, so the plugin builds the smallest graph that runs it: the node, with one loader in front of each file. Pin names and types are read from the node's live schema; nothing about a node is hard-coded.
+4. **Run.** The run is followed through Kaitoi's public API, which is also where the progress comes from.
+5. **Download** and **6. Place.** Each file the run returned is filed in the Kaitoi bin and laid on the timeline. Nothing that was already there is touched.
+
+Only one Kaitoi run happens at a time, across the window and the Inspector. Resolve is only ever called from the script's main thread; the network steps run on a worker thread.
 
 ---
 
@@ -160,73 +164,91 @@ Threading: Resolve is only ever called from the script's main thread. The panel 
 
 | Item | Value |
 |---|---|
-| API | `https://api.studio.kaitoi.io` — the origin only; the client appends `/api/v1` ([docs](https://api.studio.kaitoi.io/api/v1/docs)) |
-| Auth | Bearer API key, created in Kaitoi Studio |
-| Key store | `~/.kaitoi/credentials.json` (mode 0600) — `api_key`, `base_url`, `web_url`; shared by all Kaitoi plugins |
-| Overrides | `KAITOI_API_KEY` or `KAITOI_API` in the environment; `KAITOI_HOME` relocates `~/.kaitoi` |
-| Resolve scripting | Found automatically; `RESOLVE_SCRIPT_API` and `RESOLVE_SCRIPT_LIB` override the lookup for non-standard Resolve installs |
+| Server | `https://api.studio.kaitoi.io`, the origin only; the plugin adds `/api/v1` ([docs](https://api.studio.kaitoi.io/api/v1/docs)) |
+| Auth | A key from **Sign in with Kaitoi**, or an API key created in Kaitoi Studio |
+| Key store | `~/.kaitoi/credentials.json` (mode 0600): `api_key`, `base_url`, `web_url`; shared by Kaitoi's plugins |
+| Overrides | `KAITOI_API_KEY` or `KAITOI_API` in the environment; `KAITOI_HOME` moves `~/.kaitoi` |
+| Resolve scripting | Found automatically; `RESOLVE_SCRIPT_LIB` points at the `fusionscript` library of a Resolve installed somewhere unusual |
 | Plugin settings | `~/.kaitoi_resolve/config.json` |
-| History / log | `~/.kaitoi_resolve/history.json`, `~/.kaitoi_resolve/plugin.log` (also echoed to Resolve's Console) |
-| Work folder | `~/Movies/Kaitoi/` — exported sources and downloaded results |
+| History and log | `~/.kaitoi_resolve/history.json`, `~/.kaitoi_resolve/plugin.log` (also shown in Resolve's Console) |
+| Installed tools | Settings files in the `Kaitoi` folders of your own Fusion `Templates/Edit/Effects` and `Templates/Edit/Generators`, with a record in `~/.kaitoi_resolve/templates.json`. No node code is stored there |
+| Work folder | `~/Movies/Kaitoi/`: what was sent and what came back |
 
-Optional: run a Studio-authored project instead of the inline graph by setting `template_project_id` and `template_target_node_id` in `config.json`.
+The key is never written into the Resolve project or the timeline.
 
 ---
 
 ## Requirements
 
-- **DaVinci Resolve Studio** — developed and tested on 21.0 (macOS); earlier versions with Python scripting and `UIManager` should work but are untested. The free edition has no external scripting and no Python access to UIManager.
-- **Python 3.8+** on the path Resolve uses for scripts. Standard library only — no packages to install.
-- A [Kaitoi Studio](https://studio.kaitoi.io) account with an API key. Runs cost Kaitoi credits; the **Reverse Selftest** preset is free.
+- **DaVinci Resolve Studio.** Developed and tested on 21.2 on macOS. Windows and Linux use the same code but are untested. The free edition has no external scripting and gives scripts no UIManager, so the plugin cannot run in it.
+- **Python 3** as Resolve finds it. Standard library only: there is nothing to install with pip.
+- A [Kaitoi Studio](https://studio.kaitoi.io) account. Runs that use paid providers cost Kaitoi credits; the **Account** tab shows your balance.
 
 ---
 
 ## Architecture
 
 ```
-Kaitoi Video.py            # launcher: Workspace › Scripts › Edit entry; also a CLI
-install.sh                 # link/copy into Resolve's Scripts/Edit
+Kaitoi.py                  # what Resolve lists under Workspace > Scripts > Edit; also a command line
+install.sh                 # link or copy into Resolve's Scripts/Edit
 kaitoi_resolve/
-├─ api.py                  # stdlib urllib client: files, runs, node types, credits
-├─ credentials.py          # ~/.kaitoi/credentials.json (shared key store)
-├─ config.py               # ~/.kaitoi_resolve/config.json + log()
+├─ api.py                  # Kaitoi's public API over urllib: files, workflows, runs, nodes, credits
+├─ credentials.py          # ~/.kaitoi/credentials.json, the shared key store
+├─ signin.py               # signing in through the browser
+├─ config.py               # ~/.kaitoi_resolve/config.json and the log
 ├─ history.py              # ~/.kaitoi_resolve/history.json
-├─ graphs.py               # model presets + inline run-graph builder
-├─ resolve_bridge.py       # connect, pick clip, export range, import & place
-├─ pipeline.py             # Job: export (UI thread) → upload/run/download (worker)
-└─ ui.py                   # Fusion UIManager panel, StepLoop-driven
+├─ tools.py                # workflows and nodes as tools: inputs, outputs, filters
+├─ graphs.py               # the small graph built around a single node
+├─ templates.py            # each tool as a Resolve effect and generator
+├─ inspector.py            # running a tool from the Inspector
+├─ resolve_bridge.py       # everything that talks to Resolve
+├─ pipeline.py             # one run: export, upload, run, download, place
+├─ checks.py               # how a result differs from its source
+├─ busy.py                 # one run at a time, across scripts
+└─ ui.py                   # the window, built with Fusion's UIManager
+packaging/                 # the macOS package and the Windows setup
+tests/                     # run without Resolve: python3 -m unittest discover -s tests -t .
 ```
 
-`resolve_bridge` knows nothing about Kaitoi; `api` knows nothing about Resolve; `pipeline` is the only module that touches both.
+`resolve_bridge` knows nothing about Kaitoi, and `api` knows nothing about Resolve. `pipeline` is where the two meet.
 
 ### Resolve scripting notes
 
-Learned on Resolve 21 and handled in [`resolve_bridge.py`](kaitoi_resolve/resolve_bridge.py) / [`ui.py`](kaitoi_resolve/ui.py):
+Learned on Resolve 21 and handled in [`resolve_bridge.py`](kaitoi_resolve/resolve_bridge.py), [`templates.py`](kaitoi_resolve/templates.py) and [`ui.py`](kaitoi_resolve/ui.py):
 
-- `SetCurrentRenderFormatAndCodec` is refused until the Deliver state has been initialised once per session; the bridge warms it up and retries.
-- `VideoQuality` must be an integer (0 = automatic, else kb/s) for H.264 in MP4; the documented string levels fail the whole `SetRenderSettings` call.
+- A script can only open a floating window. Controls in the Inspector have to come from a Fusion template, which is why each tool gets one.
+- Resolve loads effect templates when it starts. A new effect cannot be added to a clip from a script until the next start; a new generator can be dragged in at once.
+- Two scripts touching the timeline at the same moment can crash Resolve, so a run announces itself and every other Kaitoi script keeps its hands off until it ends.
+- `SetCurrentRenderFormatAndCodec` is refused until the Deliver state has been set up once in a session; the bridge warms it up and tries again.
+- `VideoQuality` must be a whole number (0 for automatic, otherwise kb/s) for H.264 in MP4; the documented words fail the whole `SetRenderSettings` call.
 - `AddRenderJob` only works reliably from the Deliver page; the bridge switches pages around the export and back.
 - `AppendToTimeline`'s `endFrame` is exclusive, unlike `TimelineItem.GetEnd()`.
-- Menu scripts are `exec`'d without `__file__`; the launcher finds its package through the Scripts/Edit symlink.
-- A `ui.Timer` never fires inside `UIDispatcher.RunLoop()` for Python; the panel uses `StepLoop()` in its own loop instead.
-- Resolve calls from a worker thread block under `RunLoop` and deadlock inside Resolve; every Resolve call stays on the main thread.
-- Inside Resolve's embedded interpreter, `print` from a worker thread can raise. The logger writes the file first and swallows echo failures, so worker steps are never lost to a logging error.
+- Menu scripts are run without `__file__`; the script finds its package through the Scripts/Edit folder.
+- A `ui.Timer` never fires inside `UIDispatcher.RunLoop()` for Python; the window uses `StepLoop()` in a loop of its own.
+- A Resolve call from a worker thread blocks, and inside Resolve it deadlocks. Every Resolve call stays on the main thread.
+- Inside Resolve's own interpreter, `print` from a worker thread can raise. The log is written to its file first, so nothing is lost to that.
 
 ---
 
 ## Troubleshooting
 
-- **Run fails in ~2 s on the model node with `'NoneType' object has no attribute 'startswith'`, 0 credits charged** — that node's provider is not configured for the account. Try another preset, or check the Kaitoi dashboard. Reverse Selftest confirms the plugin itself is fine.
-- **`Could not load the DaVinci Resolve scripting module`** — only happens from a terminal, and means Resolve is not running, scripting is off in *Preferences → System → General*, or Resolve is installed somewhere non-standard. For the last case, point `RESOLVE_SCRIPT_API` at Resolve's `Developer/Scripting` folder and `RESOLVE_SCRIPT_LIB` at its `fusionscript` library. Launched from Resolve's own menu, none of this applies.
-- **Panel does not appear when launched from a terminal** — an earlier script still holds Resolve's UI dispatcher; close its window or restart Resolve.
-- **Every scripting call returns `None`** — Resolve is behind a modal dialog (for example *Cache Location Update Required* when the cache folder is on an offline volume). Dismiss it.
-- **Every request fails after editing the API base URL** — the setting is the origin (`https://api.studio.kaitoi.io`), not the versioned path; `/api/v1` is added by the client.
+- **A tool is installed but cannot be added to a clip.** Resolve loads new effects when it starts. Restart it once; until then, drag the tool from Effects > Generators > Kaitoi onto a track above the shot, or use **Run from this window**.
+- **"This Kaitoi server does not sign plugins in yet."** Paste an API key from Kaitoi Studio on the **Account** tab instead.
+- **"Kaitoi is busy with ..."** Another Kaitoi run is going, in the window or in the Inspector. Wait for it or cancel it.
+- **A node is missing from the list.** Untick **Works in Resolve** and **Only what fits the timeline selection**, and check the **Built-in**, **Community** and **User** switches. Your own nodes start switched off.
+- **`Could not load the DaVinci Resolve scripting module`.** Only from a terminal: Resolve is not running, scripting is off in *Preferences > System > General*, or Resolve is installed somewhere unusual. For the last case, point `RESOLVE_SCRIPT_LIB` at its `fusionscript` library.
+- **The window does not appear when started from a terminal.** An earlier script still holds Resolve's interface; close its window or restart Resolve.
+- **Every scripting call returns `None`.** Resolve is behind a dialog, for example *Cache Location Update Required* when the cache folder is on a volume that is offline. Dismiss it.
+- **Every request fails after changing the server.** The setting is the origin (`https://api.studio.kaitoi.io`), without `/api/v1`.
 
 ## Limitations
 
-- Video first: both modes produce video; audio is neither exported nor generated yet.
-- The generated clip keeps the model's duration; it is placed at the source's record frame, not conformed to its length.
-- The panel does not pre-check the credit balance.
+- The window floats; Resolve does not let a script dock it. Only the Inspector controls are part of Resolve's own layout.
+- A script cannot open the Inspector or switch it to Effects, so after **Use this node** you open it yourself.
+- A result keeps the length, size and frame rate the model gave it. It is placed at the source's position and not conformed to its length.
+- One run at a time.
+- The plugin shows your credit balance but does not say what a run will cost before it starts.
+- Developed on macOS. The Windows setup and Linux are untested.
 
 ---
 
@@ -240,7 +262,7 @@ Learned on Resolve 21 and handled in [`resolve_bridge.py`](kaitoi_resolve/resolv
 
 ## About Kaitoi Labs
 
-Kaitoi Labs, Inc. is a San Francisco–based team building hybrid intelligence tools for creative production, with a background spanning AI, filmmaking, VFX, and product design.
+Kaitoi Labs, Inc. is a San Francisco-based team building hybrid intelligence tools for creative production, with a background spanning AI, filmmaking, VFX, and product design.
 
 ## License
 

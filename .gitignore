@@ -19,6 +19,8 @@ tmp/
 *.mov
 *.png
 *.jpg
+# The plugin's own icons are part of it.
+!kaitoi_resolve/assets/**/*.png
 
 # ---- OS junk ----
 .DS_Store
@@ -28,3 +30,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# ---- Installer build output ----
+dist/
