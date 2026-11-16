@@ -6,13 +6,13 @@
 #   ./install.sh --uninstall
 #
 # Resolve scans the Scripts folders at startup: restart Resolve (or reopen the
-# project) after installing so "Kaitoi Video" appears under
+# project) after installing so "Kaitoi" appears under
 # Workspace > Scripts > Edit.
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAUNCHER="Kaitoi Video.py"
+LAUNCHER="Kaitoi.py"
 
 case "$(uname -s)" in
   Darwin)
@@ -49,4 +49,4 @@ else
   echo "Linked $TARGET_DIR/$LAUNCHER -> $HERE/$LAUNCHER"
 fi
 
-echo "Restart DaVinci Resolve, then open Workspace > Scripts > Edit > Kaitoi Video."
+echo "Restart DaVinci Resolve, then open Workspace > Scripts > Edit > Kaitoi."

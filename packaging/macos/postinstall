@@ -1,0 +1,175 @@
+#!/bin/bash
+# Runs when the Kaitoi package has been installed, as root.
+#
+# Puts the Kaitoi script and its two effects where DaVinci Resolve looks for
+# them: the Resolve folder of the person installing, inside their own Library.
+# That Library must be theirs and closed to every other account of the Mac,
+# and no folder on the way down from it may be a link: a link could lead out
+# to a folder other accounts can write, where a file being placed can be
+# interfered with. Resolve's folder for every user of the Mac is such a
+# folder, and this step never names it. Another person on the same Mac who
+# wants Kaitoi runs the installer too.
+#
+# Every file and folder is made, replaced or deleted as the person
+# installing, never as root. As root this step only looks: who is logged in,
+# and where their home folder is. No folder that already exists has its owner
+# or permissions changed. If the files cannot be placed they stay where the
+# package put them, with a README beside them, and the install still succeeds.
+#
+# Nothing here may read from a text block or a "<<<" string: the shell keeps
+# those in a file it writes as root, and carries on with nothing if it cannot.
+
+staged="/Library/Application Support/Kaitoi/Resolve/install"
+user="${USER:-}"
+[ -n "$user" ] && [ "$user" != "root" ] || user="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)"
+# /Search: wherever this Mac looks its accounts up, a network directory
+# included. As a property list: the plain form puts a home folder with a space
+# in its name on a line of its own.
+home="$(/usr/bin/dscl -plist /Search -read "/Users/$user" NFSHomeDirectory 2>/dev/null | /usr/bin/plutil -extract dsAttrTypeStandard:NFSHomeDirectory.0 raw - 2>/dev/null || true)"
+
+if [ "$(/usr/bin/id -u)" != "0" ]; then
+    # Not an install: the packaging test, run by an ordinary user on folders of its own.
+    staged="${KAITOI_TEST_STAGED:-$staged}"
+    home="${KAITOI_TEST_HOME:-$home}"
+    as_user() { "$@"; }
+else
+    as_user() { /usr/bin/sudo -u "$user" "$@"; }
+fi
+
+not_added() {  # say why and end the install well: the files stay in the package's folder
+    echo "Kaitoi: $1, so Kaitoi was not added to DaVinci Resolve. See $staged/README.txt."
+    exit 0
+}
+
+sources=("Kaitoi.py" "Generators/Kaitoi.setting" "Effects/Kaitoi.setting")
+folders=("Scripts/Edit" "Templates/Edit/Generators" "Templates/Edit/Effects")
+names=("Kaitoi.py" "Kaitoi.setting" "Kaitoi.setting")
+newline=$'\n'
+
+for i in 0 1 2; do
+    if [ ! -f "$staged/${sources[$i]}" ]; then
+        echo "Kaitoi: the package's own files are missing from $staged, so Kaitoi was not added to DaVinci Resolve. Run the installer again."
+        exit 0
+    fi
+done
+
+[ -n "$user" ] && [ "$user" != "root" ] || not_added "nobody is logged in"
+uid="$(/usr/bin/id -u "$user" 2>/dev/null || true)"
+[ -n "$uid" ] || not_added "$user is not an account of this Mac"
+# Root under another name, or one of the accounts macOS keeps for itself (one
+# of them owns the screen while a new Mac is being set up): nothing here is
+# written as root, and nobody works in DaVinci Resolve as those.
+[ "$uid" -ge 501 ] 2>/dev/null || not_added "$user has an account number below 501, which macOS keeps for accounts of its own"
+[ -n "$home" ] || not_added "the home folder of $user could not be found"
+as_user /usr/bin/true 2>/dev/null || not_added "the installer could not act as $user"
+
+only_theirs() {  # $1 a folder, $2 what its permission numbers must look like, $3 what to call it, $4 what is wrong with it otherwise
+    local owner_mode listing entries
+    # "/." is the folder itself, also where the name given is a link to it.
+    owner_mode="$(as_user /usr/bin/stat -f "%u %Lp" "$1/." 2>/dev/null || true)"
+    [ -n "$owner_mode" ] || not_added "$3 could not be checked"
+    [ "${owner_mode%% *}" = "$uid" ] || not_added "$3 belongs to another account"
+    # Three numbers: for the owner, the group and the rest.
+    [[ "${owner_mode##* }" == $2 ]] || not_added "$3 $4"
+    # An account can be let in by name as well, which those numbers do not
+    # show: the lines after the first say who. Any that allows anything is
+    # refused, whoever it names.
+    listing="$(as_user /bin/ls -lde "$1/." 2>/dev/null || true)"
+    [ -n "$listing" ] || not_added "$3 could not be checked"
+    entries="${listing#*$newline}"
+    [ "$entries" != "$listing" ] || entries=""
+    [ "${entries#*allow}" = "$entries" ] || not_added "$3 has extra permissions that let an account in by name"
+}
+
+# Everything below rests on this: nobody but its owner can get into the
+# Library (its numbers end in 00), so nobody else can change a folder or a
+# file while it is being put there. And nobody else can change the home folder
+# (no 2, the right to write, in its last two numbers), where the Library could
+# otherwise be swapped for another after it has been checked.
+library="$home/Library"
+only_theirs "$home" "*[0145][0145]" "the home folder of $user" "can be changed by other accounts of this Mac"
+as_user /bin/test -d "$library" || not_added "$user has no Library folder"
+! as_user /bin/test -L "$library" || not_added "the Library folder of $user is a link"
+only_theirs "$library" "*00" "the Library folder of $user" "is open to other accounts of this Mac"
+below="Application Support/Blackmagic Design/DaVinci Resolve/Fusion"
+fusion="$library/$below"
+
+unfinished=()
+placed=0
+why=""
+
+folder_for() {  # $2, a path below the folder $1: each folder on the way made where it is missing, and never through a link
+    local path="$1" rest="$2" part
+    [ -n "$rest" ] || return 1
+    while [ -n "$rest" ]; do
+        part="${rest%%/*}"
+        if [ "$part" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+        [ -n "$part" ] || return 1
+        path="$path/$part"
+        if as_user /bin/test -L "$path"; then
+            why="$path is a link, and Kaitoi is only put into folders that are inside the Library of $user themselves"
+            return 1
+        fi
+        if ! as_user /bin/test -d "$path"; then
+            if as_user /bin/test -e "$path"; then
+                why="something that is not a folder is in the way at $path"
+                return 1
+            fi
+            as_user /bin/mkdir "$path" 2>/dev/null || return 1
+        fi
+    done
+}
+
+stage() {  # each file under a name of its own beside where it goes; nothing already there is touched
+    local i target
+    folder_for "$library" "$below" || return 1
+    for i in 0 1 2; do
+        folder_for "$fusion" "${folders[$i]}" || return 1
+        target="$fusion/${folders[$i]}/${names[$i]}"
+        # A folder of that name is not replaced by a file: a move would put the file inside it.
+        if as_user /bin/test -d "$target" && ! as_user /bin/test -L "$target"; then
+            why="a folder is in the way at $target"
+            return 1
+        fi
+        unfinished[$i]="$(as_user /usr/bin/mktemp "$fusion/${folders[$i]}/.kaitoi-install.XXXXXXXX" 2>/dev/null)" \
+            && [ -n "${unfinished[$i]}" ] \
+            && as_user /bin/cp -f "$staged/${sources[$i]}" "${unfinished[$i]}" 2>/dev/null \
+            && as_user /bin/chmod 644 "${unfinished[$i]}" 2>/dev/null \
+            || return 1
+    done
+}
+
+finish() {  # each onto its name, stopping at the first that will not go
+    local i
+    for i in 0 1 2; do
+        # A move replaces what is there and never writes through it, a link
+        # to a file or (-h) to a folder included.
+        as_user /bin/mv -fh "${unfinished[$i]}" "$fusion/${folders[$i]}/${names[$i]}" 2>/dev/null || return 1
+        unfinished[$i]=""
+        placed=$((1 + placed))
+    done
+}
+
+clear_unfinished() {
+    local i
+    for i in 0 1 2; do
+        [ -z "${unfinished[$i]:-}" ] || as_user /bin/rm -f "${unfinished[$i]}" 2>/dev/null || true
+    done
+}
+
+if stage && finish; then
+    # An earlier install from the plugin's folder left these beside the
+    # script, and Resolve would list them in its Scripts menu.
+    as_user /bin/rm -f "$fusion/Scripts/Edit/Kaitoi Video.py" 2>/dev/null || true
+    as_user /bin/rm -rf "$fusion/Scripts/Edit/kaitoi_resolve" 2>/dev/null || true
+    echo "Kaitoi: added to DaVinci Resolve for $user."
+else
+    clear_unfinished
+    if [ "$placed" != "0" ]; then
+        echo "Kaitoi: only $placed of Kaitoi's 3 files could be put into DaVinci Resolve's folder for $user. See $staged/README.txt for the others."
+    else
+        [ -n "$why" ] || why="DaVinci Resolve's folder for $user could not be written"
+        not_added "$why"
+    fi
+fi
+exit 0

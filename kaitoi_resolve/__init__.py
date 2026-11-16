@@ -1,17 +1,25 @@
-"""Kaitoi bridge for DaVinci Resolve Studio.
+"""Kaitoi for DaVinci Resolve Studio.
 
-Take the clip under the playhead, write a prompt, and get a generated video
-back on the timeline — the clip's exact range is exported, sent through a
-Kaitoi node graph, and laid on a track above the original.
+Run a Kaitoi workflow or a single Kaitoi node on what the timeline plays:
+the range is exported, sent to Kaitoi, and the result is laid on a track
+above the original. A tool can be run from the Kaitoi window, or from the
+Inspector, where it sits on a clip as an effect of its own.
 
 Modules:
-    api             stdlib-only Kaitoi REST client
-    config          ~/.kaitoi_resolve/config.json (API key, defaults)
-    history         ~/.kaitoi_resolve/history.json (recent generations)
-    graphs          model presets + inline run-graph construction
+    api             Kaitoi's public API, standard library only
+    credentials     ~/.kaitoi/credentials.json, the key store Kaitoi's plugins share
+    signin          signing in through the browser
+    config          ~/.kaitoi_resolve/config.json (settings) and the log
+    history         ~/.kaitoi_resolve/history.json (finished runs)
+    tools           workflows and nodes as tools: inputs, outputs, filters
+    graphs          the small graph built around a single node
+    templates       each tool as a Resolve effect and generator
+    inspector       running a tool from the Inspector
     resolve_bridge  everything that talks to Resolve
-    pipeline        export → upload → run → download → import, off the UI thread
-    ui              the Fusion UIManager panel
+    pipeline        one run: export, upload, run, download, place
+    checks          how a result differs from its source
+    busy            one run at a time, across scripts
+    ui              the window, built with Fusion's UIManager
 """
 
 __version__ = "0.1.0"

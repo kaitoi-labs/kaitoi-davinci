@@ -17,7 +17,7 @@ MAX_ENTRIES = 50
 
 
 def path() -> str:
-    os.makedirs(config.APP_DIR, exist_ok=True)
+    config.app_dir()
     return os.path.join(config.APP_DIR, "history.json")
 
 

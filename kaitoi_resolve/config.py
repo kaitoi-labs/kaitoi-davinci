@@ -30,32 +30,56 @@ DEFAULTS: dict[str, object] = {
     "request_timeout_seconds": 120,
     "run_timeout_seconds": 900,
     "poll_interval_seconds": 3.0,
-    # Clip export (what gets uploaded).
+    # Timeline export (what gets uploaded).
     "export_format": "mp4",
     "export_codec": "H264",
     "export_max_height": 720,
     "export_quality": "Medium",
+    "export_include_audio": True,  # send a clip with its sound
+    "export_timeout_seconds": 600,
+    # Results.
+    "place_result_audio": True,  # lay a result clip's sound on a Kaitoi audio track
+    # Panel.
+    "keep_on_top": True,
+    "panel_geometry": [],  # [x, y, width, height], remembered on close
+    "follow_timeline": True,
     # Last used UI state, restored on next launch.
-    "last_mode": "v2v",
-    "last_v2v_model": "RAY35",
-    "last_i2v_model": "SEEDANCE2",
+    "last_tool": "",
+    "fits_only": True,  # Workflows tab: list only what the timeline selection can feed
+    "list_columns": [204, 116, 64],  # widths of the list's columns, as the user left them
+    "last_source_mode": "auto",
     "last_placement": "new_track",
-    "last_prompt": "",
-    # Optional: run a Studio-authored project graph instead of an inline one.
-    "template_project_id": "",
-    "template_target_node_id": "",
+    "last_values": {},  # tool id -> {field name: text}
+    # Which nodes the Nodes tab lists. An account's own nodes can run into the
+    # thousands, so they start switched off.
+    "node_origins": {"builtin": True, "community": True, "user": False},
     "external_id": "davinci_resolve_plugin",
 }
 
 
+_private: set = set()  # folders already made the user's alone, this run
+
+
+def app_dir() -> str:
+    """The plugin's folder, kept to its user. Resolve creates folders and
+    files that anyone on the machine may write, and this one holds settings,
+    what is installed and the pictures Resolve is asked to draw."""
+    os.makedirs(APP_DIR, mode=0o700, exist_ok=True)
+    if APP_DIR not in _private:
+        _private.add(APP_DIR)
+        try:
+            os.chmod(APP_DIR, 0o700)
+        except OSError:
+            pass
+    return APP_DIR
+
+
 def path() -> str:
-    os.makedirs(APP_DIR, exist_ok=True)
-    return os.path.join(APP_DIR, "config.json")
+    return os.path.join(app_dir(), "config.json")
 
 
 def log_path() -> str:
-    os.makedirs(APP_DIR, exist_ok=True)
-    return os.path.join(APP_DIR, "plugin.log")
+    return os.path.join(app_dir(), "plugin.log")
 
 
 def _read_file() -> dict:

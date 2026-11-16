@@ -1,0 +1,6 @@
+Kaitoi for DaVinci Resolve is installed.
+
+Restart DaVinci Resolve, then open Workspace > Scripts > Edit > Kaitoi.
+
+Resolve runs scripts with Python 3. If the Kaitoi entry does nothing, install
+Python 3 from python.org and restart Resolve.
