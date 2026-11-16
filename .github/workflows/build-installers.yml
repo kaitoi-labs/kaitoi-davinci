@@ -4,7 +4,15 @@ name: Build installers
 # DaVinci Resolve, signed when the signing secrets are present, and keeps them
 # as artifacts of the run. With "publish" ticked it also drafts a release in
 # this repository holding both installers; a person then reviews the draft and
-# publishes it. Nothing is made public by this workflow on its own.
+# publishes it. Nothing is released by this workflow on its own. As in any
+# public repository, a run's log is public and its artifacts can be downloaded
+# by anyone signed in to GitHub, signed installers included.
+#
+# The signing secrets are kept in this repository's "release" environment, not
+# on the repository itself. That environment can be used from main only, and a
+# run waits there until a reviewer approves it, so signed installers are built
+# from main and only after a person has said yes to that run. An unsigned test
+# build names no environment: it asks nobody and is handed no secrets.
 #
 # Secrets (the same names the Kaitoi CLI installers use):
 #   macOS    APPLE_CERTIFICATE_P12_BASE64, APPLE_CERTIFICATE_PASSWORD,
@@ -49,8 +57,11 @@ jobs:
             echo "::error::A release holds signed installers only. Tick require_signing, or untick publish for a test build."
             exit 1
           fi
-          if [ "$PUBLISH" = "true" ] && [ "$REF" != "refs/heads/main" ]; then
-            echo "::error::A release is drafted from main only; this run is on $REF."
+          # Said here, in words, before GitHub refuses the signing jobs with
+          # its own, less clear, message: only main may use the environment.
+          # A release needs signing, so this also keeps releases to main.
+          if [ "$REQUIRE_SIGNING" = "true" ] && [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Signed installers are built from main only; this run is on $REF. Untick require_signing for an unsigned test build."
             exit 1
           fi
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -85,6 +96,8 @@ jobs:
   macos:
     needs: test
     runs-on: macos-15
+    # Where the signing secrets are; see the top of this file.
+    environment: ${{ inputs.require_signing && 'release' || '' }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -105,7 +118,7 @@ jobs:
           done
           if [ "$missing" != "0" ]; then
             if [ "$REQUIRE_SIGNING" = "true" ]; then
-              echo "::error::macOS signing secrets are missing. Add them to this repository, or run with require_signing off for an unsigned test build."
+              echo "::error::macOS signing secrets are missing. Add them to the 'release' environment of this repository, or run with require_signing off for an unsigned test build."
               exit 1
             fi
             echo "::warning::macOS signing secrets are missing; building an unsigned package."
@@ -179,6 +192,8 @@ jobs:
   windows:
     needs: test
     runs-on: windows-latest
+    # Where the signing secrets are; see the top of this file.
+    environment: ${{ inputs.require_signing && 'release' || '' }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -199,7 +214,7 @@ jobs:
           done
           if [ "$missing" != "0" ]; then
             if [ "$REQUIRE_SIGNING" = "true" ]; then
-              echo "::error::Windows signing secrets are missing. Add them to this repository, or run with require_signing off for an unsigned test build."
+              echo "::error::Windows signing secrets are missing. Add them to the 'release' environment of this repository, or run with require_signing off for an unsigned test build."
               exit 1
             fi
             echo "::warning::Windows signing secrets are missing; building an unsigned setup."
