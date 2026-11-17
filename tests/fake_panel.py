@@ -127,6 +127,9 @@ def panel(settings: dict | None = None, node_tools=(), workflow_tools=(), width:
     made._installed = {}
     made._registered = None
     made._bulk = None
+    made._uninstaller = None
+    made._uninstall = None
+    made._removed = False
     made._shown = {}
     made._list_signature = None
     made.tool = None

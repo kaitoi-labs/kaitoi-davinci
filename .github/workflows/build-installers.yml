@@ -148,9 +148,10 @@ jobs:
           echo "enabled=true" >> "$GITHUB_OUTPUT"
 
       - name: Test the packaging
-        # The package layout and the step that runs after an install can only
-        # be tested on a Mac; the test job above runs on Linux and skips them.
-        run: python3 -B -m unittest tests.test_offline.Installer tests.test_offline.AfterTheMacInstall
+        # The package layout, the step that runs after an install and the
+        # uninstaller can only be tested on a Mac; the test job above runs on
+        # Linux and skips them.
+        run: python3 -B -m unittest tests.test_offline.Installer tests.test_offline.AfterTheMacInstall tests.test_offline.TheMacUninstaller tests.test_offline.TheUninstallerFromTheWindow
 
       - name: Build the package
         env:
