@@ -18,7 +18,9 @@ import io
 import json
 import mimetypes
 import os
+import re
 import secrets
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -252,7 +254,29 @@ def get_download_url(config: Config, file_id: str, *, expires_in_seconds: int = 
     return url
 
 
+NAME_LOOKUP_TRIES = 3  # how often a download is started when the host's name cannot be looked up
+
+
 def download_to(path: str, url: str, *, timeout: float = 300.0, config: Config | None = None, max_bytes: int | None = None) -> str:
+    """Stream ``url`` into ``path`` (see :func:`_download_once`).
+
+    Looking up the host's name can fail for a moment when several downloads
+    start at once, as thumbnails do. Nothing was sent then, so it is simply
+    tried again, twice at most; anything else that goes wrong is not.
+    """
+    tried = 0
+    while True:
+        try:
+            return _download_once(path, url, timeout=timeout, config=config, max_bytes=max_bytes)
+        except KaitoiAPIError as exc:
+            tried += 1
+            lookup_failed = isinstance(exc.__cause__, urllib.error.URLError) and isinstance(exc.__cause__.reason, socket.gaierror)
+            if not lookup_failed or tried >= NAME_LOOKUP_TRIES:
+                raise
+            time.sleep(0.25 * tried)
+
+
+def _download_once(path: str, url: str, *, timeout: float = 300.0, config: Config | None = None, max_bytes: int | None = None) -> str:
     """Stream ``url`` into ``path``. A half-written file is never left behind.
 
     ``max_bytes`` gives up (code ``TOO_LARGE``) as soon as the file is known
@@ -263,6 +287,10 @@ def download_to(path: str, url: str, *, timeout: float = 300.0, config: Config |
     another host.
     """
     headers = {"User-Agent": USER_AGENT}
+    try:
+        url = web_address(url)
+    except ValueError as exc:  # a link no request can be made from, as the request itself would say below
+        raise KaitoiAPIError(0, "NETWORK", f"the download broke off: {exc or type(exc).__name__}") from exc
     if url.startswith("/"):
         if config is None:
             raise KaitoiAPIError(0, "BAD_URL", "a relative download URL needs API settings")
@@ -287,7 +315,10 @@ def download_to(path: str, url: str, *, timeout: float = 300.0, config: Config |
                 fh.write(chunk)
         os.replace(partial, path)
     except urllib.error.HTTPError as exc:
-        raise KaitoiAPIError(exc.code, "DOWNLOAD", f"download failed: {exc.reason}") from exc
+        # A server that is asked too much says when to come back; whoever fetches many files heeds it.
+        later = exc.headers.get("Retry-After") if exc.headers is not None else None
+        exc.close()  # the refusal's own connection: many may be refused in a row
+        raise KaitoiAPIError(exc.code, "DOWNLOAD", f"download failed: {exc.reason}", {"retryAfterSeconds": later} if later else None) from exc
     except urllib.error.URLError as exc:
         raise KaitoiAPIError(0, "NETWORK", str(exc.reason)) from exc
     except (http.client.HTTPException, ValueError) as exc:  # a reply cut short, one that is not HTTP, or no web address
@@ -299,6 +330,20 @@ def download_to(path: str, url: str, *, timeout: float = 300.0, config: Config |
             except OSError:
                 pass
     return path
+
+
+_UNSENDABLE = re.compile(r"[^\x21-\x7e]")  # a space, a control character, or a letter outside ASCII
+
+
+def web_address(url: str) -> str:
+    """A link as it can be sent: a space, or any other character a request
+    cannot carry, written as its escape. Kaitoi hands out a link to a node's
+    thumbnail with the node's name in it as it is, and a name can have a
+    space. Every other character is left exactly as it came, so a signed link
+    stays the link that was signed."""
+    host = urllib.parse.urlsplit(url).netloc
+    start = url.index(host) + len(host) if host else 0  # the host is not a place for escapes: a name in another script has its own spelling
+    return url[:start] + _UNSENDABLE.sub(lambda found: urllib.parse.quote(found.group()), url[start:])
 
 
 def _same_origin(url: str, base_url: str) -> bool:
@@ -625,8 +670,18 @@ NODE_LIST_PIN_FIELDS = "inputs,outputs"  # a server from before these were lista
 NODE_LIST_KIND_FIELDS = "session,agent"  # and so does one from before it said which nodes are sessions and agents
 
 
-def list_node_types(config: Config, *, page_size: int = 200, should_stop: Callable[[], bool] | None = None) -> list[dict[str, Any]]:
+def list_node_types(
+    config: Config,
+    *,
+    page_size: int = 200,
+    should_stop: Callable[[], bool] | None = None,
+    on_page: Callable[[list[dict[str, Any]]], None] | None = None,
+) -> list[dict[str, Any]]:
     """Every node the account can use: built-in, community and its own.
+
+    The list comes a page at a time, and a full catalog is several pages:
+    ``on_page`` is handed each page's nodes as it arrives, so that a caller
+    can show them without waiting for the last.
 
     Each comes with its ``inputs`` and ``outputs`` when the server can list
     them, and with whether it is a session or an agent node when the server
@@ -649,7 +704,10 @@ def list_node_types(config: Config, *, page_size: int = 200, should_stop: Callab
                 if exc.code != "INVALID_FIELDS_PROJECTION" or len(asks) == 1:
                     raise
                 asks.pop(0)  # what this server refuses is not asked for again, on this page or the next
-        nodes.extend(page.get("data") or [])
+        arrived = page.get("data") or []
+        nodes.extend(arrived)
+        if on_page is not None:
+            on_page(arrived)
         cursor = page.get("nextCursor")
         if not page.get("hasMore") or not cursor:
             break

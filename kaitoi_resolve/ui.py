@@ -69,6 +69,16 @@ NAV = [
     ("NavAccount", "Account", VIEW_ACCOUNT, ""),
 ]
 LIST_CAP = 100  # rows drawn at once; a list item costs several calls into Resolve
+# Thumbnails fetched at once. One at a time, three hundred of them took over
+# two minutes. Kaitoi answers four at a time for one address, and more than
+# that only wait in line there.
+THUMBNAIL_FETCHERS = 4
+THUMBNAIL_TRIES = 3  # how often one thumbnail is asked for when Kaitoi says "not now"
+THUMBNAIL_LONGEST_WAIT_SECONDS = 60  # the minute Kaitoi counts requests over; no single wait is longer
+# How long thumbnails are waited for in all with none arriving from Kaitoi in
+# between: more than two of its minutes. After that the rest are left for the
+# next time the lists load.
+THUMBNAIL_PATIENCE_SECONDS = 150
 # Installing many nodes asks the server for each one's inputs. It allows 120
 # requests a minute from one address, shared with everything else the window
 # does, so the installer keeps to about 80.
@@ -311,15 +321,28 @@ def _placeholder(tool: tools.Tool) -> str:
 
 
 class Loader:
-    """Fetches the workflow list, the balance and thumbnails off the UI thread.
+    """Fetches the workflow list, the balance, the node catalog and thumbnails
+    off the UI thread.
 
     The UI thread starts it and later collects what it produced with
     :meth:`take`; the two only meet under the lock.
+
+    Two things are not waited for. The node catalog comes several pages long,
+    and each page is handed over as it arrives, so the first nodes are listed
+    while the rest is on its way. And thumbnails are fetched by a few threads
+    of their own, several at a time, while the lists load: one at a time, a
+    few hundred of them took minutes. The rows the window has on show are
+    fetched first (:meth:`prefer`).
+
+    Kaitoi allows an address only so many thumbnails a minute. When it says
+    "not now", every thread waits as long as it asks, and the picture goes
+    back in line.
     """
 
     def __init__(self, cfg: api.Config, known: dict | None) -> None:
         self.cfg = cfg
         self.known = known
+        self.started = time.monotonic()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._tools: list | None = None
@@ -327,7 +350,20 @@ class Loader:
         self._error: str | None = None
         self._balance: str | None = None
         self._thumbnails: list = []
-        self._nodes: list | None = None
+        self._nodes: list | None = None  # the catalog as far as it has arrived, when there is more of it than was last taken
+        self._nodes_complete = False
+        self._pending: dict = {}  # tool id -> tool whose thumbnail is still to fetch, in the order to fetch them
+        self._pending_own: dict = {}  # the same for the account's own nodes, which are listed only when asked for: after the rest
+        self._asked: set = set()  # every tool id ever put in either, so none is fetched twice
+        self._preferred: list = []  # tool ids on show in the window, first row first
+        self._listed = False  # nothing more will be added to the two above
+        self._fetched = 0
+        self._resume_at = 0.0  # no thumbnail is asked for before this: Kaitoi said "not now"
+        self._put_back: dict = {}  # tool id -> how often its thumbnail went back in line
+        self._arrived = 0  # thumbnails Kaitoi was asked for and sent; one kept on disk asks nothing and is not counted
+        self._arrived_at_wait = 0  # the same, when the last wait began
+        self._waited = 0.0  # seconds of waiting with none arriving in between
+        self._gave_up = False  # Kaitoi kept saying "not now": no more thumbnails are asked for by this loader
         self.done = False
         self._thread = threading.Thread(target=self._run, name="kaitoi-loader", daemon=True)
 
@@ -341,17 +377,140 @@ class Loader:
     def running(self) -> bool:
         return self._thread.is_alive()
 
+    def prefer(self, tool_ids) -> None:
+        """UI thread: the tools on show, first row first. Their thumbnails
+        are fetched before anyone else's."""
+        with self._lock:
+            self._preferred = list(tool_ids)
+
+    def _want(self, found) -> None:
+        """Queue the thumbnails of these tools."""
+        with self._lock:
+            if self._gave_up:
+                return
+            for tool in found:
+                if tool.thumbnail_url and tool.id not in self._asked:
+                    self._asked.add(tool.id)
+                    (self._pending_own if tool.source == "node" and tool.origin == "user" else self._pending)[tool.id] = tool
+
+    def _next_wanted(self):
+        """The next thumbnail to fetch, and whether more may still come."""
+        with self._lock:
+            for tool_id in self._preferred:
+                for pending in (self._pending, self._pending_own):
+                    if tool_id in pending:
+                        return pending.pop(tool_id), True
+            if self._pending:
+                return self._pending.pop(next(iter(self._pending))), True
+            # The account's own nodes wait for the whole catalog: a page still
+            # to come may bring Kaitoi's and the community's, which go first.
+            if self._pending_own and self._listed:
+                return self._pending_own.pop(next(iter(self._pending_own))), True
+            return None, not self._listed
+
+    def _fetch_thumbnails(self) -> None:
+        """One of the threads that fetch thumbnails, until there are none left."""
+        while not self._stop.is_set():
+            if time.monotonic() < self._resume_at:
+                time.sleep(0.05)  # Kaitoi asked for fewer requests
+                continue
+            tool, more = self._next_wanted()
+            if tool is None:
+                if not more:
+                    return
+                time.sleep(0.05)  # the lists are still loading
+                continue
+            if tool.source == "node" and tools.renditions_unavailable():
+                continue  # a server that cannot make them small: a node's stored picture is megabytes
+            try:
+                asked_of_kaitoi = not tools.thumbnail_kept(tool)
+                path = tools.fetch_thumbnail(self.cfg, tool)
+            except tools.ComeBackLater as later:
+                self._come_back(tool, later.seconds)
+                continue
+            except Exception as exc:  # noqa: BLE001 - one picture must not end the thread that fetches the rest
+                config.log(f"no thumbnail for '{tool.name}': {exc}", "WARN")
+                continue
+            if path:
+                # Sent by Kaitoi just now: not on disk before, and kept now. A
+                # path alone does not say so: an old picture is handed back
+                # as well when the new one was refused.
+                arrived = asked_of_kaitoi and tools.thumbnail_kept(tool)
+                with self._lock:
+                    self._thumbnails.append((tool.id, path))
+                    self._fetched += 1
+                    if arrived:
+                        self._arrived += 1
+
+    def _come_back(self, tool, seconds: float) -> None:
+        """Kaitoi said "not now" to this thumbnail: every thread waits, and it
+        goes to the end of the line.
+
+        One thumbnail is asked for a few times at most. And a server that goes
+        on saying "not now" is not asked for the rest: this loader would
+        otherwise be at work for as long as that lasts, and while it is, the
+        lists cannot be loaded again. The next load asks afresh. What counts
+        is the time waited with no thumbnail arriving from Kaitoi in between;
+        one that was on disk already says nothing about the server.
+        """
+        seconds = min(seconds, THUMBNAIL_LONGEST_WAIT_SECONDS)
+        now = time.monotonic()
+        gave_up = given_up_on = False
+        with self._lock:
+            if self._gave_up:
+                return
+            newly = now >= self._resume_at
+            if newly:
+                if self._arrived != self._arrived_at_wait:
+                    self._waited = 0.0
+                self._arrived_at_wait = self._arrived
+                self._waited += seconds
+            if self._waited > THUMBNAIL_PATIENCE_SECONDS:
+                left = len(self._pending) + len(self._pending_own) + 1
+                self._pending.clear()
+                self._pending_own.clear()
+                self._gave_up = gave_up = True
+                self._resume_at = 0.0  # nothing is left to wait for
+            else:
+                asked = self._put_back[tool.id] = self._put_back.get(tool.id, 0) + 1
+                if asked < THUMBNAIL_TRIES:
+                    (self._pending_own if tool.source == "node" and tool.origin == "user" else self._pending)[tool.id] = tool
+                else:
+                    given_up_on = True
+                self._resume_at = max(self._resume_at, now + seconds)
+        if gave_up:
+            config.log(f"Kaitoi keeps asking for fewer requests: {left} thumbnails are left for the next time the lists load", "WARN")
+        elif newly:
+            config.log(f"Kaitoi asked for fewer requests: thumbnails wait {seconds:.0f} s")
+        if given_up_on:
+            config.log(f"no thumbnail for '{tool.name}': asked for {THUMBNAIL_TRIES} times", "WARN")
+
+    def _take_page(self, so_far: list, page: list) -> None:
+        """A page of the node catalog has arrived."""
+        first = not so_far
+        so_far.extend(page)
+        with self._lock:
+            self._nodes = list(so_far)
+        if first and page:
+            config.log(f"first {len(page)} nodes after {time.monotonic() - self.started:.1f} s")
+        self._want(page)
+
     def _run(self) -> None:
+        fetchers = [threading.Thread(target=self._fetch_thumbnails, name=f"kaitoi-thumbnails-{at}", daemon=True) for at in range(THUMBNAIL_FETCHERS)]
         try:
+            found = []
             try:
                 found, snapshot = tools.load_workflow_tools(self.cfg, self.known, should_stop=self._stop.is_set)
                 with self._lock:
                     self._tools, self._snapshot = found, snapshot
+                config.log(f"{len(found)} workflows after {time.monotonic() - self.started:.1f} s")
             except api.KaitoiAPIError as exc:
                 if exc.code != "ABORTED":
                     with self._lock:
                         self._error = str(exc)
-                found = []
+            self._want(found)
+            for fetcher in fetchers:
+                fetcher.start()
             try:
                 balance = api.balance_text(api.account_credits(self.cfg))
                 if balance:
@@ -359,42 +518,41 @@ class Loader:
                         self._balance = balance
             except api.KaitoiAPIError:
                 pass  # the key may not carry account_credits:read; the list still works
-            for tool in found:
-                if self._stop.is_set():
-                    break
-                path = tools.fetch_thumbnail(self.cfg, tool)
-                if path:
-                    with self._lock:
-                        self._thumbnails.append((tool.id, path))
-            if not self._stop.is_set():
-                tools.drop_replaced_thumbnails(found)
-            nodes = []
+            nodes: list = []
             try:
-                nodes = tools.load_node_catalog(self.cfg, should_stop=self._stop.is_set)
+                tools.load_node_catalog(self.cfg, should_stop=self._stop.is_set, on_page=lambda page: self._take_page(nodes, page))
                 with self._lock:
-                    self._nodes = nodes
+                    self._nodes, self._nodes_complete = list(nodes), True
+                config.log(f"{len(nodes)} nodes after {time.monotonic() - self.started:.1f} s")
             except api.KaitoiAPIError as exc:
                 if exc.code != "ABORTED":
                     config.log(f"could not load the node catalog: {exc}", "WARN")
-            # Few nodes have a thumbnail. Kaitoi's own and the community's come
-            # first: an account's own nodes are listed only when asked for.
-            pictured = sorted((node for node in nodes if node.thumbnail_url), key=lambda node: node.origin == "user")
-            for node in pictured:
-                if self._stop.is_set() or tools.renditions_unavailable():
-                    break
-                path = tools.fetch_thumbnail(self.cfg, node)
-                if path:
-                    with self._lock:
-                        self._thumbnails.append((node.id, path))
+            with self._lock:
+                self._listed = True
+            for fetcher in fetchers:
+                fetcher.join()
+            if not self._stop.is_set():
+                tools.drop_replaced_thumbnails(found)
+                config.log(f"{self._fetched} thumbnails after {time.monotonic() - self.started:.1f} s")
         except Exception as exc:  # noqa: BLE001 - a loader thread must never die silently
             config.log(f"workflow loader crashed: {exc}", "ERROR")
+            self._stop.set()  # nobody will take what the threads that fetch thumbnails bring
             with self._lock:
                 self._error = f"Could not load workflows: {exc}"
         finally:
+            with self._lock:
+                self._listed = True  # whatever happened, the threads that fetch thumbnails are not left waiting
+            for fetcher in fetchers:
+                if fetcher.is_alive():
+                    fetcher.join()  # this loader is at work for as long as any of them is
             self.done = True
 
     def take(self) -> dict[str, Any]:
-        """Everything new since the last call. UI thread only."""
+        """Everything new since the last call. UI thread only.
+
+        ``nodes`` is the catalog as far as it has arrived, the pages before
+        included; ``nodes_complete`` says whether that is all of it.
+        """
         with self._lock:
             out = {
                 "tools": self._tools,
@@ -403,6 +561,7 @@ class Loader:
                 "balance": self._balance,
                 "thumbnails": self._thumbnails,
                 "nodes": self._nodes,
+                "nodes_complete": self._nodes_complete and self._nodes is not None,
             }
             self._tools = self._snapshot = self._error = self._balance = self._nodes = None
             self._thumbnails = []
@@ -427,6 +586,9 @@ class Panel:
         # What Resolve has loaded; None when this Resolve cannot say.
         self._registered: set | None = resolve_bridge.registered_effects(session, templates.FOLDER)
         self._bulk: dict[str, Any] | None = None  # an "install all" in progress
+        self._on_show: list = []  # tool ids the list has on show, for the loader (see _rebuild_list)
+        self._chosen_for_them = ""  # the tool the list chose by itself because none was chosen: its first row
+        self._show_entries: tuple | None = None  # what the Show filter holds: (keys, labels)
         self._uninstaller = uninstall.script()  # None where this copy of the plugin came without one
         self._uninstall: dict[str, Any] | None = None  # the uninstaller at work: {"done", "code", "left"}
         self._removed = False  # Kaitoi was uninstalled from this window: it only waits to be closed
@@ -1456,7 +1618,9 @@ class Panel:
             self.load_error = str(exc)
             return
         self.load_error = ""
+        config.log("loading workflows and nodes")
         self.loader = Loader(cfg, tools.read_snapshot(cfg.base_url, tools.account_mark(cfg.api_key)))
+        self.loader.prefer(self._on_show)
         self.loader.start()
         if not quiet:
             self.status("Loading your workflows...")
@@ -1466,6 +1630,10 @@ class Panel:
         loader = self.loader
         if loader is None:
             return False
+        # Asked before taking: a loader that ends while the window is busy
+        # with what it took has more to hand over, and is kept for one more
+        # pass. Asked after, its last page and last thumbnails were dropped.
+        finished = loader.done and not loader.running
         fresh = loader.take()
         if fresh["error"]:
             self.load_error = fresh["error"]
@@ -1495,20 +1663,49 @@ class Panel:
             if self.job is None and self._shown.get(("Status", "Text")) == "Loading your workflows...":
                 self.status("")
         if fresh["nodes"] is not None:
+            began = time.monotonic()
+            listed_before = {node.id for node in self.node_tools}  # before this page: see the node used last time, below
+            arrived = fresh["nodes"]
+            if not fresh["nodes_complete"]:
+                # The first pages of the catalog: listed now, beside whatever
+                # was listed before. Nothing is taken off the list until the
+                # whole catalog is in and it is known what is no longer there.
+                have = {node.id for node in arrived}
+                arrived = arrived + [node for node in self.node_tools if node.id not in have]
             # Keep the pins of nodes already opened; the catalog only has summaries.
             opened = {tool.id: tool for tool in self.node_tools if tool.ready}
-            self.node_tools = [node if node.ready else opened.get(node.id, node) for node in fresh["nodes"]]
+            self.node_tools = [node if node.ready else opened.get(node.id, node) for node in arrived]
             # A refreshed catalog knows nothing of the lists nodes filled in; put them back.
             self.node_tools = [tools.apply_initial_state(node, self._states[node.id]) if node.id in self._states else node for node in self.node_tools]
+            chosen_before = self.tool
             if self.tool is not None and self.tool.source == "node":
                 self.tool = next((node for node in self.node_tools if node.id == self.tool.id), self.tool)
-            # Pins are stored only when the server listed them (see write_nodes).
-            tools.write_nodes(self._base_url(), self._account(), self.node_tools, with_pins=any(node.ready for node in fresh["nodes"]))
+            if fresh["nodes_complete"]:
+                # Pins are stored only when the server listed them (see write_nodes).
+                tools.write_nodes(self._base_url(), self._account(), self.node_tools, with_pins=any(node.ready for node in fresh["nodes"]))
             if self.catalog == NODES:
                 keep = self.tool.id if self.tool else self._remembered_tool()
+                remembered, by_the_list = self._remembered_tool(), self._chosen_for_them
+                if (
+                    self.tool is not None
+                    and self.tool.id == by_the_list  # nobody chose it: the list did, having nothing else
+                    and self.view != VIEW_RUN  # and nobody has its form open
+                    and remembered
+                    and remembered not in listed_before  # the node used last time was not there to choose,
+                    and any(node.id == remembered for node in self.node_tools)  # and has arrived with this page
+                ):
+                    keep = remembered
                 self._rebuild_show_filter()
                 self._rebuild_list()
-                self._select_tool(keep)
+                # A page of the catalog is no reason to lay an open form out
+                # again, under someone who may be typing into it: only when
+                # the chosen node itself changed, or there is none.
+                if fresh["nodes_complete"] or self.tool is None or self.tool != chosen_before or keep != self.tool.id:
+                    self._select_tool(keep)
+                    if keep == by_the_list and self.tool is not None and self.tool.id == by_the_list:
+                        self._chosen_for_them = by_the_list  # chosen again by the window itself: still nobody's choice
+            if fresh["nodes_complete"]:
+                config.log(f"{len(self.node_tools)} nodes listed {time.monotonic() - loader.started:.1f} s after loading began; the window took {time.monotonic() - began:.1f} s over it")
         by_id = {tool.id: tool for tool in self.all_tools} if fresh["thumbnails"] else {}
         for tool_id, path in fresh["thumbnails"]:
             item = self._tool_items.get(tool_id)
@@ -1516,11 +1713,13 @@ class Panel:
             if tool is not None:
                 self._tiles.pop(tools.thumbnail_path(tool), None)  # fetched, or fetched again: look at what is there now
             if item is not None and tool is not None:
-                self._set_item_icon(item, self._picture(tool))  # a 16:9 picture or its cut; the icon again if the cut is gone
-                self._list_signature = None  # its picture may have changed; the next real rebuild recomputes
+                # A 16:9 picture or its cut; the icon again if the cut is gone.
+                # The list is not redrawn for it: the next rebuild finds the
+                # row's picture changed and nothing else (see _rebuild_list).
+                self._set_item_icon(item, self._picture(tool))
             if self.tool is not None and self.tool.id == tool_id:
                 self._show_thumbnail(self.tool)
-        if loader.done and not loader.running:
+        if finished:
             self.loader = None
             return False
         return True
@@ -1552,11 +1751,17 @@ class Panel:
             current = self.show_key if self.show_key.startswith("task:") else "task:"
         self._updating = True
         try:
-            combo.Clear()
-            for label in labels:
-                combo.AddItem(label)
-            self._show_keys = keys
-            combo.CurrentIndex = keys.index(current) if current in keys else 0
+            if (keys, labels) != self._show_entries:
+                # Only when its entries changed: refilled, the list tells the
+                # window its choice changed, and the list of tools is drawn
+                # again for each. Pages of the node catalog arrive one after
+                # another, most with no category the filter does not have.
+                combo.Clear()
+                for label in labels:
+                    combo.AddItem(label)
+                self._show_keys = keys
+                self._show_entries = (keys, labels)
+                combo.CurrentIndex = keys.index(current) if current in keys else 0
             counts = {origin: sum(1 for node in self.node_tools if node.origin == origin) for origin, _, _ in ORIGINS}
             for origin, box_id, label in ORIGINS:
                 self._put(box_id, "ToolTip", f"{counts[origin]} {label.lower()} nodes")
@@ -1587,6 +1792,7 @@ class Panel:
         tool = self.tool
         if tool is None:
             return
+        self._chosen_for_them = ""  # acted on: theirs now
         marked = self.favorites
         marked.symmetric_difference_update({tool.id})
         # Saved at once: a favorite is something the user did, not a state of the window.
@@ -1695,6 +1901,24 @@ class Panel:
             known = self._tiles[stored] = tools.thumbnail_tile(tool) or ""
         return known or _placeholder(tool)
 
+    @staticmethod
+    def _pictures_changed(drawn, wanted) -> list | None:
+        """Where two drawings of the list differ only in the pictures of their
+        rows: ``(tool id, picture)`` for each row whose picture changed. None
+        when anything else differs, or nothing is drawn yet."""
+        if drawn is None or len(drawn) != len(wanted):
+            return None
+        changed = []
+        for (category, rows), (was_category, was_rows) in zip(wanted, drawn):
+            if category != was_category or len(rows) != len(was_rows):
+                return None
+            for (tool_id, name, task, picture, state), (was_id, was_name, was_task, was_picture, was_state) in zip(rows, was_rows):
+                if (tool_id, name, task, state) != (was_id, was_name, was_task, was_state):
+                    return None
+                if picture != was_picture:
+                    changed.append((tool_id, picture))
+        return changed
+
     def _rebuild_list(self) -> None:
         """Redraw the list from the tools, the filter and the search box."""
         tree = self.items["Tools"]
@@ -1707,6 +1931,10 @@ class Panel:
         self._matched = len(matched)
         current_id = self.tool.id if self.tool else ""
         grouped = tools.group(chosen)
+        # The card's picture, then the rows as drawn: what a loader at work fetches thumbnails for first.
+        self._on_show = ([current_id] if current_id else []) + [tool.id for _, members in grouped for tool in members if tool.id != current_id]
+        if self.loader is not None:
+            self.loader.prefer(self._on_show)
         signature = tuple(
             (category, tuple((tool.id, self._row_name(tool, marked), tools.task_label(tool), self._picture(tool), self._state(tool)) for tool in members))
             for category, members in grouped
@@ -1714,6 +1942,19 @@ class Panel:
         if signature == self._list_signature:
             self._update_list_info(len(chosen))
             return  # the same rows are already on screen: redrawing them is the flicker
+        changed = self._pictures_changed(self._list_signature, signature)
+        if changed is not None:
+            # The same rows, some with a thumbnail that has arrived since:
+            # those get their picture where they are. While the lists load,
+            # thumbnails come in all the time, and a whole redraw for each
+            # would be the list flickering for as long as it takes.
+            for tool_id, picture in changed:
+                item = self._tool_items.get(tool_id)
+                if item is not None:
+                    self._set_item_icon(item, picture)
+            self._list_signature = signature
+            self._update_list_info(len(chosen))
+            return
         self._list_signature = signature
         self.rebuilds += 1
         self._updating = True
@@ -1755,6 +1996,7 @@ class Panel:
         if self.tool is None and chosen and not query.strip():
             first = grouped[0][1][0]  # the first row as the list shows it
             self._select_tool(first.id)
+            self._chosen_for_them = self.tool.id if self.tool is not None else ""  # not the user's choice: see _collect_loader
 
     def _draw_columns(self) -> None:
         """Put the column widths on the list, cut to fit the window.
@@ -1856,6 +2098,7 @@ class Panel:
                     self._set_view(VIEW_BROWSE)
             return
         self.tool = found
+        self._chosen_for_them = ""  # chosen by whoever asked; the list says so itself when it was the list (see _rebuild_list)
         self._updating = True
         try:
             for other_id, other in self._tool_items.items():
@@ -1878,6 +2121,8 @@ class Panel:
         if not tool_id:  # a category heading
             return
         found = next((tool for tool in self.all_tools if tool.id == tool_id), None)
+        if found is not None:
+            self._chosen_for_them = ""  # clicked: theirs now, also when it is the row the list had chosen
         if found is None or (self.tool is not None and found.id == self.tool.id):
             return
         self._retry_state_on_pick(found)
@@ -2139,6 +2384,7 @@ class Panel:
 
     def _toggle_install(self) -> None:
         """The card's link: install the chosen tool in Resolve, or remove it."""
+        self._chosen_for_them = ""  # acted on: theirs now
         tool = self.tool
         if tool is None or tool.source == "workflow":
             return
@@ -2370,6 +2616,7 @@ class Panel:
         the workflow's generator is laid at the playhead. Where neither is
         possible the reason is given and the workflow opens in this window.
         """
+        self._chosen_for_them = ""  # acted on: theirs now
         tool = self.tool
         if tool is None:
             return
@@ -2433,6 +2680,7 @@ class Panel:
     def _open_run(self) -> None:
         if self.tool is None:
             return
+        self._chosen_for_them = ""  # its form is opened: theirs now
         self._retry_state_on_pick(self.tool)
         self._want_state(self.tool)
         self._show_run()

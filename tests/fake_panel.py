@@ -98,16 +98,24 @@ class FinishedLoader:
 
     done, running = True, False
 
-    def __init__(self, thumbnails=()):
+    started = 0.0
+
+    def __init__(self, thumbnails=(), nodes=None, nodes_complete=True):
         self.thumbnails = list(thumbnails)
+        self.nodes, self.nodes_complete = nodes, nodes_complete  # a page of the node catalog to hand over, and whether it is the last
+        self.preferred: list = []
         self.stopped = False
 
     def take(self):
         out, self.thumbnails = self.thumbnails, []
-        return {"tools": None, "snapshot": None, "error": None, "balance": None, "nodes": None, "thumbnails": out}
+        nodes, self.nodes = self.nodes, None
+        return {"tools": None, "snapshot": None, "error": None, "balance": None, "nodes": nodes, "nodes_complete": nodes is not None and self.nodes_complete, "thumbnails": out}
 
     def stop(self):
         self.stopped = True
+
+    def prefer(self, tool_ids):
+        self.preferred = list(tool_ids)
 
 
 def panel(settings: dict | None = None, node_tools=(), workflow_tools=(), width: int | None = None) -> ui.Panel:
@@ -127,6 +135,9 @@ def panel(settings: dict | None = None, node_tools=(), workflow_tools=(), width:
     made._installed = {}
     made._registered = None
     made._bulk = None
+    made._on_show = []
+    made._chosen_for_them = ""
+    made._show_entries = None
     made._uninstaller = None
     made._uninstall = None
     made._removed = False
