@@ -859,7 +859,8 @@ def write_snapshot(snapshot: dict) -> None:
 
 def thumbnail_dir() -> str:
     directory = os.path.join(config.app_dir(), "thumbnails")
-    os.makedirs(directory, mode=0o700, exist_ok=True)
+    if os.path.isdir(config.APP_DIR):  # absent only once the plugin is uninstalled, and then not made again (config.leave_gone)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
     return directory
 
 

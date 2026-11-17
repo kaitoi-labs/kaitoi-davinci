@@ -58,12 +58,24 @@ DEFAULTS: dict[str, object] = {
 
 
 _private: set = set()  # folders already made the user's alone, this run
+_quiet = False  # the plugin is being uninstalled, or has been: its folder is not made again
+
+
+def leave_gone(on: bool) -> None:
+    """While the plugin is being uninstalled, and after: stop making its
+    folder, so that nothing is put back behind the uninstaller. A folder that
+    is still there is written to as before; one that is gone stays gone, and
+    the log with it. Switched off again when the uninstall did not happen."""
+    global _quiet
+    _quiet = bool(on)
 
 
 def app_dir() -> str:
     """The plugin's folder, kept to its user. Resolve creates folders and
     files that anyone on the machine may write, and this one holds settings,
     what is installed and the pictures Resolve is asked to draw."""
+    if _quiet:
+        return APP_DIR
     os.makedirs(APP_DIR, mode=0o700, exist_ok=True)
     if APP_DIR not in _private:
         _private.add(APP_DIR)

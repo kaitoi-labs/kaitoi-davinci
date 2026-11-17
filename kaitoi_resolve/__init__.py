@@ -19,6 +19,7 @@ Modules:
     pipeline        one run: export, upload, run, download, place
     checks          how a result differs from its source
     busy            one run at a time, across scripts
+    uninstall       the uninstaller the macOS installer puts beside the code
     ui              the window, built with Fusion's UIManager
 """
 

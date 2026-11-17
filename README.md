@@ -73,6 +73,14 @@ The script goes into your own scripts folder:
 
 **5. Run something.** Select a clip. On **Nodes**, tick **Works in Resolve**, pick a node, and press **Run from this window**, then **Generate**. The result lands on a Kaitoi track above your clip.
 
+### Uninstall
+
+*Installed with the macOS installer.* On the **Account** tab press **Uninstall Kaitoi**, then **Uninstall**. macOS asks for your password, and the window tells you when to restart Resolve. If the window does not open, double-click `Uninstall Kaitoi.command` in `/Library/Application Support/Kaitoi/Resolve` (in Finder, **Go > Go to Folder**). It does the same.
+
+This removes the Kaitoi script and effects from your Resolve folder, and Kaitoi's code from the Mac. The code is shared by every account of the Mac, so Kaitoi stops working in Resolve for all of them. Tick **Also remove my settings and history** to forget those too. Your results (in `~/Movies/Kaitoi` unless you changed the work folder) and your Kaitoi sign-in are never removed, and an effect you saved yourself into one of Kaitoi's folders stays where it is.
+
+*Installed from this repository.* Run `./install.sh --uninstall`.
+
 ### From a terminal
 
 The same script drives a running Resolve from a shell, which is handy while developing:
@@ -134,7 +142,7 @@ Export   ›   Upload   ›   Prepare   ›   Run   ›   Download   ›   Place
 
 - *What gets sent*: **Max height** and **Quality** of the video that is uploaded, and **Send clips with their sound**.
 - *Results*: **Place on** (a Kaitoi track at the source, the end of the timeline, or the media pool only), **Work folder**, **Give up after (s)**, and **Put a result clip's sound on its own audio track**.
-- *In Resolve*: how many tools are in your Effects Library, and **Remove everything Kaitoi installed**.
+- *In Resolve*: how many tools are in your Effects Library, **Remove everything Kaitoi installed**, and, when Kaitoi came from the macOS installer, **Uninstall Kaitoi**.
 - *Window*: **Follow what is selected on the timeline** and **Stay on top**.
 
 ---

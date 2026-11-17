@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from kaitoi_resolve import busy, checks, config, history, resolve_bridge, templates, tools
+from kaitoi_resolve import busy, checks, config, history, resolve_bridge, templates, tools, uninstall
 
 
 def field(name, data_type, **extra):
@@ -842,14 +842,14 @@ class Installer(unittest.TestCase):
             listed = subprocess.run(["pkgutil", "--payload-files", package], capture_output=True, text=True).stdout.splitlines()
             files = {line[1:] for line in listed if "/._" not in line}  # "._" entries only carry file attributes
             for wanted in ("/install/Kaitoi.py", "/install/Generators/Kaitoi.setting", "/install/Effects/Kaitoi.setting", "/install/README.txt",
-                           "/kaitoi_resolve/ui.py", "/kaitoi_resolve/assets/icons/film.png", "/LICENSE"):
+                           "/kaitoi_resolve/ui.py", "/kaitoi_resolve/uninstall.py", "/kaitoi_resolve/assets/icons/film.png", "/LICENSE", "/Uninstall Kaitoi.command"):
                 self.assertIn(wanted, files)
             self.assertFalse([name for name in files if "__pycache__" in name or name.endswith((".pyc", ".DS_Store")) or "/tests/" in name])
             # An installer sets the owner and permissions of every folder a
             # package carries. Resolve's folders are kept open to its user;
             # carried here, they would be closed to them.
             self.assertFalse([name for name in files if "Blackmagic" in name or name.startswith("/Library")], "none of Resolve's folders, and nothing above its own")
-            self.assertEqual({name.split("/")[1] for name in files if name}, {"install", "kaitoi_resolve", "LICENSE"})
+            self.assertEqual({name.split("/")[1] for name in files if name}, {"install", "kaitoi_resolve", "LICENSE", "Uninstall Kaitoi.command"})
             expanded = os.path.join(out, "expanded")
             subprocess.run(["pkgutil", "--expand", package, expanded], check=True, capture_output=True)
             info = next(os.path.join(base, "PackageInfo") for base, _, names in os.walk(expanded) if "PackageInfo" in names)
@@ -858,6 +858,16 @@ class Installer(unittest.TestCase):
             carried = next(os.path.join(base, "postinstall") for base, _, names in os.walk(expanded) if "postinstall" in names)
             with open(carried, "rb") as packed, open(os.path.join(self.REPO, "packaging", "macos", "postinstall"), "rb") as source:
                 self.assertEqual(packed.read(), source.read(), "the step that is tested below is the one that ships")
+            # The uninstaller: the file tested below, where the window looks for it, and able to be run.
+            whole = os.path.join(out, "whole")
+            subprocess.run(["pkgutil", "--expand-full", package, whole], check=True, capture_output=True)
+            shipped = next(os.path.join(base, "Uninstall Kaitoi.command") for base, _, names in os.walk(whole) if "Uninstall Kaitoi.command" in names)
+            with open(shipped, "rb") as packed, open(os.path.join(self.REPO, "packaging", "macos", "uninstall"), "rb") as source:
+                self.assertEqual(packed.read(), source.read())
+            self.assertEqual(os.stat(shipped).st_mode & 0o777, 0o755, "run by a double-click, and changed by nobody but an administrator")
+            self.assertTrue(os.path.isdir(os.path.join(os.path.dirname(shipped), "kaitoi_resolve")), "beside the code: that is where the window looks for it")
+            with open(os.path.join(os.path.dirname(shipped), "install", "README.txt"), encoding="utf-8") as fh:
+                self.assertIn('"Uninstall Kaitoi.command"', fh.read())
             with open(os.path.join(expanded, "Distribution"), "r", encoding="utf-8") as fh:
                 self.assertIn('<domains enable_localSystem="true" enable_anywhere="false" enable_currentUserHome="false"/>', fh.read(), "this Mac's own disk only: the last step and Resolve look nowhere else")
             self.assertEqual(subprocess.run(["/usr/sbin/installer", "-dominfo", "-pkg", package], capture_output=True, text=True).stdout.split(), ["LocalSystem"])
@@ -899,6 +909,402 @@ class Installer(unittest.TestCase):
             os.remove(os.path.join(work, "good", "install", "Kaitoi.py"))
             subprocess.run(["pkgbuild", "--root", os.path.join(work, "good"), "--install-location", home, "--identifier", "io.kaitoi.test", "--version", "1", good], check=True, capture_output=True)
             self.assertEqual(subprocess.run([check, good], capture_output=True).returncode, 1, "and one that lacks the script")
+
+
+@unittest.skipUnless(__import__("sys").platform == "darwin", "the macOS uninstaller")
+class TheMacUninstaller(unittest.TestCase):
+    """packaging/macos/uninstall, run on a home folder and a shared folder made here.
+
+    Every run goes through :meth:`uninstall`, which always names both. Left to
+    itself the script would act on the real home folder and ask for the real
+    password.
+    """
+
+    REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    SCRIPT = os.path.join(REPO, "packaging", "macos", "uninstall")
+    OWN = "Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion"
+    OURS = ["Scripts/Edit/Kaitoi.py", "Templates/Edit/Generators/Kaitoi.setting", "Templates/Edit/Effects/Kaitoi.setting",
+            "Templates/Edit/Generators/Kaitoi/Rain.setting", "Templates/Edit/Generators/Kaitoi/Rain.png",
+            "Templates/Edit/Effects/Kaitoi/Rain.setting", "Templates/Edit/Effects/Kaitoi/Rain.png"]
+    THEIRS = ["Scripts/Edit/My Own.py", "Templates/Edit/Generators/Mine.setting", "Templates/Edit/Effects/Other Folder/Theirs.setting"]
+    KEPT = ["Movies/Kaitoi/result.mp4", ".kaitoi/credentials.json"]
+    SETTINGS = [".kaitoi_resolve/config.json", ".kaitoi_resolve/history.json", ".kaitoi_resolve/plugin.log"]
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.root = os.path.join(os.path.realpath(self.dir.name), "a mac")  # a space, as real paths here have
+        self.home = os.path.join(self.root, "home")
+        self.shared = os.path.join(self.root, "shared", "Kaitoi", "Resolve")
+        self.own = os.path.join(self.home, self.OWN)
+        for name in self.OURS:
+            self.put(f"{self.OWN}/{name}", "an effect of Kaitoi's { KaitoiSpec = ... }" if "/Kaitoi/" in name and name.endswith(".setting") else "kaitoi")
+        for name in self.THEIRS:
+            self.put(f"{self.OWN}/{name}", "theirs")
+        for name in self.KEPT + self.SETTINGS + [".kaitoi_resolve/templates.json"]:
+            self.put(name)
+        for name in ("kaitoi_resolve/ui.py", "install/Kaitoi.py", "Uninstall Kaitoi.command"):
+            path = os.path.join(self.shared, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("code")
+
+    def put(self, name, text="x"):
+        path = os.path.join(self.home, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def uninstall(self, *arguments, typed=None, **changed):
+        import subprocess
+
+        self.assertTrue(self.home.startswith(self.root) and self.shared.startswith(self.root) and tempfile.gettempdir() not in ("", "/"))
+        env = {**os.environ, "HOME": self.home, "KAITOI_TEST_SHARED": self.shared, **changed}
+        self.assertTrue(env["HOME"].startswith(self.root + os.sep) and env["KAITOI_TEST_SHARED"].startswith(self.root + os.sep), "never the real home folder, never the real password: both are inside this test's own folder")
+        done = subprocess.run(["/bin/bash", self.SCRIPT, *arguments], env=env, input=typed if typed is not None else "", capture_output=True, text=True, cwd=self.root)
+        self.assertEqual(done.stderr, "")
+        return done.returncode, done.stdout
+
+    def everything(self, folder=None):
+        """Every file, folder and link below a folder, with what each file holds."""
+        folder = folder or self.root
+        found = {}
+        for base, folders, names in os.walk(folder):
+            for name in folders + names:
+                path = os.path.join(base, name)
+                if os.path.islink(path):
+                    found[os.path.relpath(path, folder)] = "-> " + os.readlink(path)
+                elif os.path.isdir(path):
+                    found[os.path.relpath(path, folder)] = None
+                else:
+                    with open(path, encoding="utf-8") as fh:
+                        found[os.path.relpath(path, folder)] = fh.read()
+        return found
+
+    def files(self, folder):
+        return sorted(os.path.relpath(os.path.join(base, name), folder) for base, _, names in os.walk(folder) for name in names)
+
+    def test_all_of_kaitoi_goes_and_nothing_of_anyone_elses(self):
+        code, said = self.uninstall("--yes")
+        self.assertEqual((code, said), (0, "Kaitoi was removed. Restart DaVinci Resolve to clear it from the menus.\n"))
+        self.assertEqual(self.files(self.own), sorted(self.THEIRS), "the user's own script and effects, and nothing of Kaitoi's")
+        self.assertFalse(os.path.exists(os.path.join(self.own, "Templates/Edit/Generators/Kaitoi")), "its two folders of effects go when they are empty")
+        self.assertFalse(os.path.exists(os.path.join(self.own, "Templates/Edit/Effects/Kaitoi")))
+        self.assertFalse(os.path.exists(self.shared), "the code every account shares")
+        self.assertEqual([name for name in self.files(self.home) if not name.startswith("Library")], sorted(self.KEPT + self.SETTINGS), "results, the sign-in and the settings stay; the list of installed effects does not")
+        self.assertEqual(self.uninstall("--yes")[0], 0, "a second time there is nothing to do, and that is not a failure")
+
+    def test_settings_and_history_go_only_when_asked(self):
+        self.assertEqual(self.uninstall("--yes", "--settings")[0], 0)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".kaitoi_resolve")))
+        self.assertEqual([name for name in self.files(self.home) if not name.startswith("Library")], sorted(self.KEPT), "results and the sign-in are never touched")
+
+    def test_a_password_that_is_not_given_leaves_everything_as_it_was(self):
+        before = self.everything()
+        code, said = self.uninstall("--yes", "--settings", KAITOI_TEST_REFUSE="1")
+        self.assertEqual(code, 1)
+        self.assertIn("Nothing was removed", said)
+        self.assertEqual(self.everything(), before, "the step that needs the password comes first")
+
+    def test_asked_in_terminal_nothing_goes_without_a_yes(self):
+        before = self.everything()
+        for typed in ("", "\n", "n\n", "no\n", "maybe\n", "yes please\n"):
+            code, said = self.uninstall(typed=typed)
+            self.assertEqual(code, 1, repr(typed))
+            self.assertTrue(said.endswith("Nothing was removed.\n"))
+            self.assertEqual(self.everything(), before, repr(typed))
+        code, said = self.uninstall(typed="y\n\n")
+        self.assertEqual(code, 0, said)
+        self.assertIn("every account of this Mac", said)
+        self.assertTrue(os.path.exists(os.path.join(self.home, ".kaitoi_resolve/config.json")), "settings are kept unless that is answered with a yes too")
+        self.assertEqual(self.files(self.own), sorted(self.THEIRS))
+
+    def test_asked_in_terminal_a_second_yes_removes_the_settings(self):
+        self.assertEqual(self.uninstall(typed="yes\ny\n")[0], 0)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".kaitoi_resolve")))
+
+    def test_someone_elses_effect_in_a_kaitoi_folder_stays_and_is_named(self):
+        theirs = self.put(f"{self.OWN}/Templates/Edit/Effects/Kaitoi/Saved By Hand.setting", "{ Tools = {} }")
+        picture = self.put(f"{self.OWN}/Templates/Edit/Effects/Kaitoi/Saved By Hand.png")
+        code, said = self.uninstall("--yes")
+        self.assertEqual(code, 3)
+        self.assertEqual(said.splitlines()[1:], ["Left in place: " + os.path.dirname(theirs)])
+        self.assertEqual(sorted(os.listdir(os.path.dirname(theirs))), ["Saved By Hand.png", "Saved By Hand.setting"])
+        self.assertTrue(os.path.exists(picture))
+        self.assertFalse(os.path.exists(os.path.join(self.own, "Templates/Edit/Generators/Kaitoi")), "the other folder held only Kaitoi's")
+        self.assertFalse(os.path.exists(self.shared))
+
+    def test_a_folder_where_one_of_kaitois_files_would_be_is_left_alone(self):
+        os.remove(os.path.join(self.own, "Templates/Edit/Effects/Kaitoi.setting"))
+        inside = self.put(f"{self.OWN}/Templates/Edit/Effects/Kaitoi.setting/theirs.txt", "theirs")
+        code, said = self.uninstall("--yes")
+        self.assertEqual(code, 3)
+        self.assertIn("Left in place: " + os.path.dirname(inside), said)
+        self.assertTrue(os.path.exists(inside))
+
+    def test_links_are_removed_and_never_followed(self):
+        """An install from the plugin's folder leaves a link to the script; and a link is never emptied as if it were Kaitoi's folder."""
+        checkout = os.path.join(self.root, "checkout")
+        elsewhere = os.path.join(self.root, "elsewhere")
+        for folder in (checkout, elsewhere):
+            os.makedirs(folder)
+        for name in ("Kaitoi.py",):
+            with open(os.path.join(checkout, name), "w", encoding="utf-8") as fh:
+                fh.write("the script, in the plugin's own folder")
+        with open(os.path.join(elsewhere, "Rain.setting"), "w", encoding="utf-8") as fh:
+            fh.write("KaitoiSpec, somewhere that is not Kaitoi's folder")
+        script = os.path.join(self.own, "Scripts/Edit/Kaitoi.py")
+        os.remove(script)
+        os.symlink(os.path.join(checkout, "Kaitoi.py"), script)
+        copied = self.put(f"{self.OWN}/Scripts/Edit/kaitoi_resolve/ui.py")
+        effects = os.path.join(self.own, "Templates/Edit/Generators/Kaitoi")
+        for name in os.listdir(effects):
+            os.remove(os.path.join(effects, name))
+        os.rmdir(effects)
+        os.symlink(elsewhere, effects)
+        settings = os.path.join(self.home, ".kaitoi_resolve")
+        kept_elsewhere = os.path.join(self.root, "settings elsewhere")
+        os.rename(settings, kept_elsewhere)
+        os.symlink(kept_elsewhere, settings)
+        code, said = self.uninstall("--yes", "--settings")
+        self.assertEqual(code, 3)
+        self.assertEqual(said.splitlines()[1:], ["Left in place: " + effects], "a link where the folder of effects would be is said, and left")
+        self.assertFalse(os.path.lexists(script))
+        self.assertFalse(os.path.exists(os.path.dirname(copied)), "the copy of the code an older install left beside the script")
+        self.assertEqual(os.listdir(checkout), ["Kaitoi.py"], "what the link led to is not Kaitoi's to delete")
+        self.assertEqual(os.listdir(elsewhere), ["Rain.setting"])
+        self.assertFalse(os.path.lexists(settings))
+        self.assertIn("config.json", os.listdir(kept_elsewhere), "the link to the settings goes, not the folder it led to")
+
+    def test_with_no_code_installed_for_every_account_the_users_own_files_still_go(self):
+        """An install from the plugin's folder: there is nothing that needs a password."""
+        import shutil
+
+        shutil.rmtree(self.shared)
+        self.assertEqual(self.uninstall("--yes", KAITOI_TEST_REFUSE="1")[0], 0, "the password is not asked for, so it cannot be refused")
+        self.assertEqual(self.files(self.own), sorted(self.THEIRS))
+
+    def test_anything_else_on_the_command_line_stops_it_before_it_starts(self):
+        before = self.everything()
+        for arguments in (["--all"], ["--yes", "extra"], ["-y"], ["--yes", "--settings=1"]):
+            code, said = self.uninstall(*arguments)
+            self.assertEqual(code, 2, arguments)
+            self.assertIn("usage:", said)
+        self.assertEqual(self.everything(), before)
+
+    def test_a_home_folder_that_cannot_be_found_stops_it(self):
+        """Run only with a home folder that is missing from this test's own folder: were the check to fail, nothing real is below it.
+        With no home at all the paths would start at the top of the disk, so that case is read as text and never run."""
+        before = self.everything()
+        code, said = self.uninstall("--yes", HOME=os.path.join(self.root, "nobody"))
+        self.assertEqual(code, 1)
+        self.assertIn("nothing was removed", said)
+        self.assertEqual(self.everything(), before)
+        script = self.script()
+        guard = '''    local home="${HOME:-}"
+    if [ -z "$home" ] || [ ! -d "$home/Library" ]; then
+        echo "Your home folder could not be found, so nothing was removed."
+        return 1
+    fi
+'''
+        self.assertEqual(script.count(guard), 1)
+        self.assertEqual(len(re.findall(r"(?<![\w$])home=", script)), 1, "set once, and checked before anything is built from it")
+        self.assertLess(script.index(guard), script.index('local fusion="$home/Library/$below"'))
+
+    def test_it_refuses_to_run_as_root(self):
+        """Read as text: as root, the home folder and the files would be root's. It comes before anything else is looked at."""
+        script = self.script()
+        guard = '''    if [ "$(/usr/bin/id -u)" = "0" ]; then
+        echo "Run this as yourself, without sudo. It removes Kaitoi from your own DaVinci Resolve folder, and macOS asks for a password when one is needed."
+        return 1
+    fi
+'''
+        self.assertEqual(script.count(guard), 1)
+        self.assertLess(script.index(guard), script.index('local home="${HOME:-}"'))
+        self.assertNotRegex(script, r"\bEUID\b|\bUID\b", "who it runs as is asked of the system, not read from a variable anyone can set")
+
+    def test_nothing_is_deleted_through_a_link_on_the_way_down(self):
+        """A Scripts or Templates folder that is a link leads somewhere other people or other computers may share."""
+        import shutil
+
+        shared_scripts = os.path.join(self.root, "synced", "Scripts")
+        shared_templates = os.path.join(self.root, "synced", "Templates")
+        shutil.move(os.path.join(self.own, "Scripts"), shared_scripts)
+        shutil.move(os.path.join(self.own, "Templates"), shared_templates)
+        os.symlink(shared_scripts, os.path.join(self.own, "Scripts"))
+        os.symlink(shared_templates, os.path.join(self.own, "Templates"))
+        for name in ("Edit/kaitoi_resolve/ui.py", "Edit/Kaitoi Video.py"):
+            path = os.path.join(shared_scripts, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("kaitoi")
+        before = self.everything(os.path.join(self.root, "synced"))
+        code, said = self.uninstall("--yes")
+        self.assertEqual(code, 3)
+        self.assertEqual(self.everything(os.path.join(self.root, "synced")), before, "nothing behind either link was touched")
+        named = [line[len("Left in place: "):] for line in said.splitlines()[1:]]
+        self.assertEqual(sorted(named), sorted(os.path.join(self.own, name) for name in (
+            "Scripts/Edit/Kaitoi.py", "Scripts/Edit/Kaitoi Video.py", "Scripts/Edit/kaitoi_resolve",
+            "Templates/Edit/Generators/Kaitoi.setting", "Templates/Edit/Generators/Kaitoi", "Templates/Edit/Effects/Kaitoi.setting", "Templates/Edit/Effects/Kaitoi")),
+            "and each thing of Kaitoi's there is named, so it can be removed by hand")
+        self.assertFalse(os.path.exists(self.shared), "Kaitoi's own code is still removed")
+
+    def test_a_link_on_the_way_with_nothing_of_kaitois_behind_it_is_not_mentioned(self):
+        import shutil
+
+        elsewhere = os.path.join(self.root, "synced", "Templates")
+        shutil.rmtree(os.path.join(self.own, "Templates"))
+        os.makedirs(os.path.join(elsewhere, "Edit", "Effects"))
+        with open(os.path.join(elsewhere, "Edit", "Effects", "Mine.setting"), "w", encoding="utf-8") as fh:
+            fh.write("theirs")
+        os.symlink(elsewhere, os.path.join(self.own, "Templates"))
+        code, said = self.uninstall("--yes")
+        self.assertEqual((code, said.count("\n")), (0, 1), said)
+        self.assertEqual(self.files(elsewhere), ["Edit/Effects/Mine.setting"])
+
+    def test_the_library_itself_as_a_link_is_not_gone_through_either(self):
+        real = os.path.join(self.root, "the real library")
+        os.rename(os.path.join(self.home, "Library"), real)
+        os.symlink(real, os.path.join(self.home, "Library"))
+        before = self.everything(real)
+        code, said = self.uninstall("--yes")
+        self.assertEqual(code, 3)
+        self.assertEqual(self.everything(real), before)
+        self.assertEqual(said.count("Left in place: "), len(self.OURS) - 2, "the script, the two effects and the two folders of effects")
+
+    def test_a_stand_in_for_the_shared_folder_must_be_named_as_the_real_one_is(self):
+        """So that the name of some other folder, set by mistake, deletes nothing."""
+        before = self.everything()
+        for other in (os.path.join(self.root, "home"), os.path.join(self.root, "shared"), os.path.join(self.root, "shared", "Kaitoi"), self.shared + "/", self.shared + " 2"):
+            code, said = self.uninstall("--yes", "--settings", KAITOI_TEST_SHARED=other)
+            self.assertEqual(code, 2, other)
+            self.assertIn("Nothing was removed.", said)
+        self.assertEqual(self.everything(), before)
+
+    def script(self):
+        with open(self.SCRIPT, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_step_run_as_an_administrator_is_written_out_in_full(self):
+        """Read as text: the real step cannot be run in a test. It deletes Kaitoi's own folder and nothing else, and takes nothing from outside."""
+        script = self.script()
+        steps = re.findall(r"^.*osascript.*$", script, re.M)
+        self.assertEqual(len(steps), 1)
+        step = steps[0].strip()
+        self.assertEqual(step, r"""elif ! /usr/bin/osascript -e 'do shell script "/bin/rm -rf \"/Library/Application Support/Kaitoi/Resolve\" && { /bin/rmdir \"/Library/Application Support/Kaitoi\"; /usr/sbin/pkgutil --forget io.kaitoi.resolve-plugin; /usr/bin/true; } >/dev/null 2>&1" with prompt "Kaitoi needs your password to remove its files from this Mac." with administrator privileges' >/dev/null 2>&1; then""")
+        self.assertNotRegex(step, r"\$|`", "nothing in it comes from a variable or from another command")
+        code = "\n".join(line for line in script.splitlines() if not line.strip().startswith("#"))
+        self.assertNotRegex(code, r"\beval\b|\bsource\b|\bexec\b|^\s*\. ", "nothing is run that is not written here")
+        self.assertEqual(re.findall(r".*\bsudo\b.*", code), ['        echo "Run this as yourself, without sudo. It removes Kaitoi from your own DaVinci Resolve folder, and macOS asks for a password when one is needed."'],
+                         "the word is only said, to someone who started it that way: there is no other way to act as someone else")
+        self.assertEqual(code.count("administrator privileges"), 1)
+        # Every program is named by its full path: none is found through a PATH someone else set.
+        for program in re.findall(r"(?:^|[;|&!({]|\bif|\bthen|\belif)\s*(/[\w/]+)", code, re.M):
+            self.assertRegex(program, r"^/(usr/)?s?bin/[a-z]+$")
+        self.assertEqual(sorted(set(re.findall(r"(?<![\w/\"$}])(?:rm|rmdir|grep|osascript|pkgutil|id|read|cd|printf|echo)\b(?= )", code)) - {"read", "cd", "printf", "echo"}), [], "a program run by its bare name")
+
+    def test_the_tests_stand_in_never_reaches_the_real_folder_or_the_password(self):
+        script = self.script()
+        self.assertEqual(script.count("KAITOI_TEST_SHARED"), 4, "tested for, checked, said when it is wrong, then taken")
+        self.assertEqual(script.count("KAITOI_TEST_"), 5, "and the refusal a test can ask for")
+        branch = re.search(r'if \[ "\$testing" = "1" \]; then\n(.*?)\n        elif ! /usr/bin/osascript', script, re.S)
+        self.assertIsNotNone(branch, "a test takes one branch and the password the other: never both")
+        self.assertNotIn("osascript", branch.group(1))
+        self.assertIn('elif [ "$testing" = "0" ] && /usr/sbin/pkgutil --pkg-info io.kaitoi.resolve-plugin', script, "nor is the real package looked up from a test")
+
+    def test_it_is_read_to_its_end_before_any_of_it_runs(self):
+        """It lies in the folder it deletes."""
+        script = self.script()
+        self.assertTrue(script.rstrip().endswith('main "$@"\nexit $?'))
+        outside = [line for line in script.split("\nmain() {\n")[0].splitlines() if line.strip() and not line.startswith("#")]
+        self.assertEqual(outside, ["set -u"])
+        self.assertTrue(os.access(self.SCRIPT, os.X_OK))
+
+
+class TheUninstallerFromTheWindow(unittest.TestCase):
+    """kaitoi_resolve.uninstall: finding the uninstaller the installer left, and running it."""
+
+    REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_it_is_looked_for_beside_the_code_on_a_mac_only(self):
+        with tempfile.TemporaryDirectory() as root:
+            package = os.path.join(root, "Resolve", "kaitoi_resolve")
+            os.makedirs(package)
+            beside = os.path.join(root, "Resolve", "Uninstall Kaitoi.command")
+            with mock.patch.object(uninstall, "__file__", os.path.join(package, "uninstall.py")), mock.patch.object(uninstall.sys, "platform", "darwin"):
+                self.assertIsNone(uninstall.script(), "an install from the plugin's own folder has none")
+                with open(beside, "w", encoding="utf-8") as fh:
+                    fh.write("#!/bin/bash\n")
+                os.chmod(beside, 0o644)
+                self.assertIsNone(uninstall.script(), "one that cannot be run is not offered")
+                os.chmod(beside, 0o755)
+                self.assertEqual(uninstall.script(), beside)
+                with mock.patch.object(uninstall.sys, "platform", "win32"):
+                    self.assertIsNone(uninstall.script(), "Windows removes Kaitoi from its own list of apps")
+                with mock.patch.object(uninstall.sys, "platform", "linux"):
+                    self.assertIsNone(uninstall.script())
+        with mock.patch.object(uninstall.sys, "platform", "darwin"):
+            self.assertIsNone(uninstall.script(), "run from the repository, as these tests are, there is none beside the code")
+
+    @unittest.skipUnless(__import__("sys").platform == "darwin", "the macOS uninstaller")
+    def test_the_real_one_is_run_without_questions_and_its_answer_is_read(self):
+        script = os.path.join(self.REPO, "packaging", "macos", "uninstall")
+        with tempfile.TemporaryDirectory() as root:
+            root = os.path.realpath(root)
+            home, shared = os.path.join(root, "jos\u00e9"), os.path.join(root, "shared", "Kaitoi", "Resolve")  # an accent, as a home folder can have
+            own = os.path.join(home, "Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion")
+
+            def fill():
+                for path in (os.path.join(own, "Scripts/Edit/Kaitoi.py"), os.path.join(home, ".kaitoi_resolve/config.json"), os.path.join(shared, "kaitoi_resolve/ui.py")):
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as fh:
+                        fh.write("x")
+
+            # Both named, always: left to itself it would act on the real home folder and ask for the real password.
+            with mock.patch.dict(os.environ, {"HOME": home, "KAITOI_TEST_SHARED": shared}):
+                fill()
+                with mock.patch.dict(os.environ, {"KAITOI_TEST_REFUSE": "1"}):
+                    self.assertEqual(uninstall.run(script, settings=True), (uninstall.NOTHING, []))
+                self.assertTrue(os.path.exists(os.path.join(own, "Scripts/Edit/Kaitoi.py")))
+                self.assertEqual(uninstall.run(script, settings=False), (uninstall.REMOVED, []))
+                self.assertFalse(os.path.exists(os.path.join(own, "Scripts/Edit/Kaitoi.py")))
+                self.assertFalse(os.path.exists(shared))
+                self.assertTrue(os.path.exists(os.path.join(home, ".kaitoi_resolve/config.json")), "settings stay unless asked")
+                fill()
+                theirs = os.path.join(own, "Templates/Edit/Effects/Kaitoi")
+                os.makedirs(theirs)
+                with open(os.path.join(theirs, "Saved By Hand.setting"), "w", encoding="utf-8") as fh:
+                    fh.write("theirs")
+                self.assertEqual(uninstall.run(script, settings=True), (uninstall.LEFT, [theirs]))
+                self.assertFalse(os.path.exists(os.path.join(home, ".kaitoi_resolve")))
+
+    def test_what_the_uninstaller_says_is_read_as_utf_8_whatever_the_python_it_runs_in_expects(self):
+        """Resolve's own Python may take text to be ASCII. A home folder with an accent in its name must not turn a finished uninstall into an error."""
+        said = mock.Mock(returncode=3, stdout="Kaitoi was removed.\nLeft in place: /Users/jos\u00e9/Library/a folder/Kaitoi\n")
+        with mock.patch.object(uninstall.subprocess, "run", return_value=said) as ran:
+            self.assertEqual(uninstall.run("/a folder/Uninstall Kaitoi.command", settings=True), (3, ["/Users/jos\u00e9/Library/a folder/Kaitoi"]))
+        (command,), how = ran.call_args
+        self.assertEqual(command, ["/a folder/Uninstall Kaitoi.command", "--yes", "--settings"])
+        self.assertEqual((how["encoding"], how["errors"]), ("utf-8", "replace"))
+        self.assertNotIn("text", how)
+        self.assertEqual(how["cwd"], "/", "not from the folder it deletes")
+
+    def test_while_kaitoi_is_being_removed_its_folder_is_not_made_again(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = os.path.join(root, "gone")
+            with mock.patch.object(config, "APP_DIR", folder), mock.patch.object(config, "_private", set()), mock.patch("builtins.print"):
+                self.addCleanup(config.leave_gone, False)
+                config.leave_gone(True)
+                self.assertEqual(config.app_dir(), folder)
+                config.log("said after the uninstall")
+                self.assertFalse(busy.holder())
+                self.assertEqual(tools.thumbnail_dir(), os.path.join(folder, "thumbnails"))
+                self.assertFalse(os.path.exists(folder), "nothing is put back behind the uninstaller")
+                config.leave_gone(False)
+                config.log("said when the uninstall did not happen")
+                with open(os.path.join(folder, "plugin.log"), encoding="utf-8") as fh:
+                    self.assertIn("did not happen", fh.read())
 
 
 class PackageCheck(unittest.TestCase):
@@ -957,6 +1363,14 @@ exec /bin/cat "{listing}"
             self.assertEqual(self.check(["."] + [line for line in self.OURS if line != missing] + self.BULK)[0], 1, missing)
         self.assertEqual(self.check([])[0], 1)
         self.assertEqual(self.check(["."] + self.OURS + ["./kaitoi_resolve/Library/notes.txt", "./install/Library", "./LICENSE", "./._LICENSE", "./kaitoi_resolve/._ui.py", "./._install"])[0], 0, "what is inside our two folders is ours, whatever it is called")
+
+    def test_the_uninstaller_is_ours_and_nothing_that_only_looks_like_it_is(self):
+        ours = ["."] + self.OURS
+        self.assertEqual(self.check(ours + ["./Uninstall Kaitoi.command", "./._Uninstall Kaitoi.command"])[0], 0)
+        for foreign in ("./Uninstall Kaitoi.command/inside", "./Uninstall KaitoiXcommand", "./Uninstall Other.command", "./Uninstall Kaitoi.command.sh"):
+            code, said = self.check(ours + [foreign])
+            self.assertEqual(code, 1, foreign)
+            self.assertIn("not Kaitoi's own", said)
 
     def test_our_own_files_installed_into_someone_elses_folder_are_refused(self):
         ours = ["."] + self.OURS

@@ -5,8 +5,9 @@
 #
 # The package itself installs one folder, /Library/Application Support/Kaitoi/Resolve:
 # the plugin's code (outside Resolve's Scripts folders, where Resolve would
-# list each of its files in the Scripts menu) and, under install/, the three
-# files Resolve has to find:
+# list each of its files in the Scripts menu), "Uninstall Kaitoi.command",
+# which removes all of it again, and, under install/, the three files Resolve
+# has to find:
 #   - the "Kaitoi" script, listed under Workspace > Scripts > Edit
 #   - the Kaitoi generator and effect, for Resolve's Effects Library
 # Those three are copied when the install ends into the Resolve folder of the
@@ -80,21 +81,28 @@ can write to, any of them can change it.
 
 Then restart DaVinci Resolve and open Workspace > Scripts > Edit > Kaitoi.
 
-To remove Kaitoi from your own DaVinci Resolve, delete from that Fusion folder:
+To remove Kaitoi, press Uninstall Kaitoi on the Account tab of the Kaitoi
+window, or double-click "Uninstall Kaitoi.command" in
+/Library/Application Support/Kaitoi/Resolve. Both do the same, and macOS asks
+for your password. Your results and your Kaitoi sign-in are not touched.
+
+To remove it by hand instead, delete from that Fusion folder:
   the three files above
   Templates/Edit/Generators/Kaitoi and Templates/Edit/Effects/Kaitoi, the
     two folders of effects Kaitoi made for you
 and, to forget your Kaitoi settings as well, the folder ~/.kaitoi_resolve.
-
-To remove Kaitoi from this Mac altogether, also delete the folder
-/Library/Application Support/Kaitoi/Resolve. Every person on this Mac shares
-it, so Kaitoi stops working in DaVinci Resolve for all of them. Then run in
-Terminal:
+Then delete the folder /Library/Application Support/Kaitoi/Resolve. Every
+person on this Mac shares it, so Kaitoi stops working in DaVinci Resolve for
+all of them. Then run in Terminal:
   sudo pkgutil --forget io.kaitoi.resolve-plugin
 README
 # The package as it is in the repository, without caches or editor leftovers.
 rsync -a --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' "$REPO/kaitoi_resolve" "$ROOT/"
 cp "$REPO/LICENSE" "$ROOT/LICENSE"
+# Beside the code, where only an administrator can change it, and under the
+# name a double-click opens in Terminal.
+cp "$HERE/uninstall" "$ROOT/Uninstall Kaitoi.command"
+chmod 755 "$ROOT/Uninstall Kaitoi.command"
 find "$ROOT" -name '.DS_Store' -delete
 # Files carry extended attributes from wherever they were checked out; left
 # on, each would be installed with a "._" twin beside it.

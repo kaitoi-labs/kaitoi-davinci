@@ -7,7 +7,7 @@
 # carries. DaVinci Resolve keeps its folders open to its user, so a package
 # that carried them would close them. The package must install into
 # /Library/Application Support/Kaitoi/Resolve and list only what belongs
-# there: its code, install/ and the licence.
+# there: its code, install/, the uninstaller and the licence.
 #
 # The listing is read once into a variable and searched there. Piped straight
 # into "grep -q", the lister is cut off at the first match, and under
@@ -39,7 +39,7 @@ for wanted in "./install/Kaitoi.py" "./install/Generators/Kaitoi.setting" "./ins
     fi
 done
 # Nothing at its top but what is ours ("._" entries only carry a file's attributes).
-foreign="$(grep -vE '^\.$|^\./(install|kaitoi_resolve)(/|$)|^\./LICENSE$|^\./\._(install|kaitoi_resolve|LICENSE)$' <<<"$files" || true)"
+foreign="$(grep -vE '^\.$|^\./(install|kaitoi_resolve)(/|$)|^\./(LICENSE|Uninstall Kaitoi\.command)$|^\./\._(install|kaitoi_resolve|LICENSE|Uninstall Kaitoi\.command)$' <<<"$files" || true)"
 if [ -n "$foreign" ]; then
     echo "ERROR: the package carries folders that are not Kaitoi's own:"
     head -5 <<<"$foreign"

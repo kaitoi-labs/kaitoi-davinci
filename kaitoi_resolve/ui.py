@@ -37,7 +37,7 @@ import uuid
 import webbrowser
 from typing import Any
 
-from . import api, busy, config, credentials, history, pipeline, resolve_bridge, signin, templates, tools
+from . import api, busy, config, credentials, history, pipeline, resolve_bridge, signin, templates, tools, uninstall
 
 WINDOW_ID = "KaitoiResolveWin"
 DEFAULT_GEOMETRY = [120, 110, 440, 780]
@@ -57,6 +57,9 @@ GENERIC_ICONS = {"video": "film", "image": "image", "audio": "audio-lines", "tex
 ICON_NAME = re.compile(r"[a-z0-9-]{1,60}")  # an icon name is used as a file name: nothing else is let through
 
 VIEW_BROWSE, VIEW_RUN, VIEW_HISTORY, VIEW_ACCOUNT = 0, 1, 2, 3
+VIEW_UNINSTALL = 4  # asked for from the Account tab; once the uninstaller has started, no tab leads away
+# What stands under the message on that view: the question's buttons, nothing while macOS asks for the password, then the way out.
+STAGE_ASK, STAGE_WAIT, STAGE_GONE = 0, 1, 2
 WORKFLOWS, NODES = "workflows", "nodes"
 # (button, title, view, catalog): the two catalogs share one browsing view.
 NAV = [
@@ -217,6 +220,17 @@ def bar_style(done: float) -> str:
         return f"background: {C_ACCENT}; border-radius: 2px;"
     return (f"background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {C_ACCENT}, stop:{at:.3f} {C_ACCENT}, "
             f"stop:{min(1.0, at + 0.001):.3f} {C_LINE}, stop:1 {C_LINE}); border-radius: 2px;")
+
+
+UNINSTALL_ASK = (
+    "Uninstall Kaitoi?\n\n"
+    "This removes Kaitoi from your DaVinci Resolve, and its code from this Mac, so it stops working for every account. "
+    "macOS asks for your password.\n\n"
+    "Your results and your Kaitoi sign-in stay."
+)
+UNINSTALL_WHAT = "the uninstaller"  # what the other Kaitoi scripts are told Kaitoi is busy with meanwhile
+UNINSTALLING = "Removing Kaitoi. macOS asks for your password."
+UNINSTALLED = "Kaitoi was removed from this Mac.\nRestart DaVinci Resolve to clear it from the menus."
 
 
 def _nav_style(active: bool) -> str:
@@ -413,6 +427,9 @@ class Panel:
         # What Resolve has loaded; None when this Resolve cannot say.
         self._registered: set | None = resolve_bridge.registered_effects(session, templates.FOLDER)
         self._bulk: dict[str, Any] | None = None  # an "install all" in progress
+        self._uninstaller = uninstall.script()  # None where this copy of the plugin came without one
+        self._uninstall: dict[str, Any] | None = None  # the uninstaller at work: {"done", "code", "left"}
+        self._removed = False  # Kaitoi was uninstalled from this window: it only waits to be closed
         self._shown: dict[tuple[str, str], Any] = {}  # (widget, property) -> the value last put there
         self._list_signature: Any = None
         self.rebuilds = 0  # how many times the list was really redrawn
@@ -506,7 +523,7 @@ class Panel:
                 ),
                 ui.Stack(
                     {"ID": "Views", "Weight": 1.0},
-                    [self._browse_view(), self._run_view(), self._history_view(), self._account_view()],
+                    [self._browse_view(), self._run_view(), self._history_view(), self._account_view(), self._uninstall_view()],
                 ),
                 # Under every view, so a run can be followed from the list as well.
                 ui.Label({"ID": "Progress", "Text": "", "Weight": 0.0, "Visible": False, "MinimumSize": [0, 0], "MaximumSize": [16777215, 0], "StyleSheet": bar_style(0)}),
@@ -877,14 +894,66 @@ class Panel:
                     }
                 ),
                 ui.HGroup(
-                    {"Weight": 0.0},
-                    [ui.Button({"ID": "RemoveAll", "Text": "Remove everything Kaitoi installed", "Weight": 0.0, "StyleSheet": STYLE_QUIET}), ui.HGap(0, 1.0)],
+                    {"Weight": 0.0, "Spacing": 8},
+                    [
+                        ui.Button({"ID": "RemoveAll", "Text": "Remove everything Kaitoi installed", "Weight": 0.0, "StyleSheet": STYLE_QUIET}),
+                        *([ui.Button({"ID": "Uninstall", "Text": "Uninstall Kaitoi", "Weight": 0.0, "StyleSheet": STYLE_QUIET})] if self._uninstaller else []),
+                        ui.HGap(0, 1.0),
+                    ],
                 ),
                 heading("Window"),
                 ui.CheckBox({"ID": "FollowTimeline", "Text": "Follow what is selected on the timeline", "Weight": 0.0}),
                 ui.CheckBox({"ID": "KeepOnTop", "Text": "Stay on top (from the next time it opens)", "Weight": 0.0}),
                 ui.VGap(0, 1.0),
                 ui.Button({"ID": "SaveSettings", "Text": "Save", "Weight": 0.0, "StyleSheet": STYLE_PRIMARY}),
+            ],
+        )
+
+    def _uninstall_view(self):
+        """Uninstalling, on a view of its own: the question, then one message
+        while macOS asks for the password, then the way out.
+
+        A view and not rows of the Account tab, because in this UI kit a
+        hidden row keeps its space: rows that come and go would leave a gap
+        in the tab, and make the window taller for everyone. What changes
+        under the message is one page of a stack for the same reason.
+        """
+        ui = self.ui
+        return ui.VGroup(
+            {"Spacing": 12},
+            [
+                ui.VGap(0, 1.0),
+                ui.Label({"ID": "UninstallText", "Text": "", "Weight": 0.0, "WordWrap": True, "Alignment": {"AlignTop": True, "AlignLeft": True}, "StyleSheet": STYLE_BODY}),
+                ui.Stack(
+                    {"ID": "UninstallStage", "Weight": 0.0},
+                    [
+                        ui.VGroup(
+                            {"Spacing": 10},
+                            [
+                                ui.CheckBox({"ID": "UninstallSettings", "Text": "Also remove my settings and history", "Weight": 0.0}),
+                                ui.HGroup(
+                                    {"Weight": 0.0, "Spacing": 8},
+                                    [
+                                        ui.Button({"ID": "UninstallGo", "Text": "Uninstall", "Weight": 0.0, "StyleSheet": STYLE_PRIMARY}),
+                                        ui.Button({"ID": "UninstallCancel", "Text": "Cancel", "Weight": 0.0, "StyleSheet": STYLE_QUIET}),
+                                        ui.HGap(0, 1.0),
+                                    ],
+                                ),
+                            ],
+                        ),
+                        ui.Label({"Text": "", "Weight": 0.0}),
+                        ui.VGroup(
+                            [
+                                ui.HGroup(
+                                    {"Weight": 0.0},
+                                    [ui.Button({"ID": "UninstallClose", "Text": "Close", "Weight": 0.0, "StyleSheet": STYLE_PRIMARY}), ui.HGap(0, 1.0)],
+                                ),
+                                ui.VGap(0, 1.0),
+                            ]
+                        ),
+                    ],
+                ),
+                ui.VGap(0, 2.0),
             ],
         )
 
@@ -1077,6 +1146,11 @@ class Panel:
         events.FavoritesOnly.Clicked = lambda ev: self._on_kept_changed()
         events.Favorite.Clicked = lambda ev: self._toggle_favorite()
         events.RemoveAll.Clicked = lambda ev: self._remove_all()
+        if self._uninstaller:
+            events.Uninstall.Clicked = lambda ev: self._uninstall_pressed()
+        events.UninstallGo.Clicked = lambda ev: self._uninstall_confirmed()
+        events.UninstallCancel.Clicked = lambda ev: self._uninstall_cancelled()
+        events.UninstallClose.Clicked = lambda ev: self._on_close()
         events.Back.Clicked = lambda ev: self._set_view(VIEW_BROWSE)
         events.Reload.Clicked = lambda ev: self.reload_workflows()
         events.SourceMode.CurrentIndexChanged = lambda ev: self._on_source_mode()
@@ -2183,6 +2257,109 @@ class Panel:
         )
         self._refresh_installed()
 
+    # ── uninstalling ────────────────────────────────────────────────────────
+
+    def _uninstall_blocked(self) -> bool:
+        """Is something of Kaitoi's still at work? Uninstalled under it, part
+        of Kaitoi would be written back, or a run that was paid for would
+        never be placed. Says what, so that it is plain what to wait for."""
+        if self.job is not None:  # also one whose result has arrived and is about to be placed
+            why = "A run is still going. Wait for it or cancel it, then uninstall."
+        elif self._bulk is not None:
+            why = "An install is still running. Stop it first, then uninstall."
+        elif getattr(self, "_signin", None) is not None:
+            why = "A sign-in is still waiting. Finish it first, then uninstall."
+        elif busy.held_by_other(self._owner):
+            why = "A run started from the Inspector is still going. Wait for it, then uninstall."
+        elif self.loader is not None and self.loader.running:
+            why = "Kaitoi is still loading your workflows. Try again in a moment."
+        else:
+            return False
+        self.status(why)
+        return True
+
+    def _show_uninstall(self, text: str, stage: int) -> None:
+        """Put a message on the uninstall view, with what belongs under it."""
+        self._put("UninstallText", "Text", text)
+        self._put("UninstallText", "MinimumSize", [0, self._text_height(text, letter=6.6, line=17)])
+        self.items["UninstallStage"].CurrentIndex = stage
+        self._relayout()
+
+    def _uninstall_pressed(self) -> None:
+        """Ask first. Nothing is removed by this button."""
+        if self._uninstall_blocked():
+            return
+        self.items["UninstallSettings"].Checked = False
+        self._show_uninstall(UNINSTALL_ASK, STAGE_ASK)
+        self._set_view(VIEW_UNINSTALL)
+
+    def _uninstall_cancelled(self) -> None:
+        if self._uninstall is None and not self._removed:
+            self._set_view(VIEW_ACCOUNT)
+
+    def _uninstall_confirmed(self) -> None:
+        """Run the uninstaller, and show nothing else until it has answered.
+
+        It waits for a password, so it runs on a thread; the window keeps
+        answering, and has only this message in it. From here on nothing is
+        written into Kaitoi's folders: what the uninstaller deletes must not
+        be put back behind it.
+        """
+        if self._uninstall is not None or self._removed or not self._uninstaller or self.view != VIEW_UNINSTALL:
+            return
+        # The same marker a run sets: while it stands, a Generate pressed in
+        # the Inspector is refused, so no run starts under the uninstaller.
+        if self._uninstall_blocked() or not busy.acquire(self._owner, UNINSTALL_WHAT):
+            self._set_view(VIEW_ACCOUNT)
+            return
+        path, settings = self._uninstaller, bool(self.items["UninstallSettings"].Checked)
+        state: dict[str, Any] = {"done": threading.Event(), "code": uninstall.NOTHING, "left": []}
+
+        def work() -> None:
+            try:
+                state["code"], state["left"] = uninstall.run(path, settings=settings)
+            except Exception:  # noqa: BLE001 - it could not be started, so nothing was removed
+                state["code"] = uninstall.NOTHING
+            finally:
+                state["done"].set()
+
+        self._uninstall = state
+        config.leave_gone(True)
+        for button_id, _, _, _ in NAV:
+            self.items[button_id].Enabled = False
+        self.status("")
+        self._show_uninstall(UNINSTALLING, STAGE_WAIT)
+        threading.Thread(target=work, name="kaitoi-uninstall", daemon=True).start()
+
+    def _collect_uninstall(self) -> bool:
+        """Take the uninstaller's answer when it has one. True while it runs."""
+        state = self._uninstall
+        if state is None:
+            return False
+        if not state["done"].is_set():
+            busy.renew(self._owner)
+            return True
+        self._uninstall = None
+        busy.release(self._owner)
+        # However it ended, an uninstaller that is no longer there did its
+        # work: it is in the folder it deletes. Its answer alone could be lost
+        # on the way, and the window would then carry on with its code gone.
+        removed = state["code"] in (uninstall.REMOVED, uninstall.LEFT) or not os.path.exists(self._uninstaller or "")
+        if not removed:
+            # The password was not given: everything is as it was, and so is the window.
+            config.leave_gone(False)
+            for button_id, _, _, _ in NAV:
+                self.items[button_id].Enabled = True
+            self._set_view(VIEW_ACCOUNT)
+            self.status("Nothing was removed.")
+            return False
+        self._removed = True
+        text = UNINSTALLED
+        if state["left"]:
+            text += "\n\nThese were left in place:\n" + "\n".join(state["left"])
+        self._show_uninstall(text, STAGE_GONE)
+        return False
+
     def _use(self) -> None:
         """Put the chosen workflow on the timeline, so the Inspector runs it.
 
@@ -2729,6 +2906,8 @@ class Panel:
 
         Returns True while a network thread is busy (the caller sleeps longer).
         """
+        if self._uninstall is not None or self._removed:
+            return self._collect_uninstall()  # nothing else moves while Kaitoi is being removed, or once it is gone
         loading = self._collect_loader()
         loading = self._collect_sign_in() or loading
         loading = self._collect_nodes() or loading
@@ -3017,6 +3196,10 @@ class Panel:
             )
 
     def _on_close(self, _event=None) -> None:
+        if self._uninstall is not None or self._removed:
+            # Kaitoi is being removed, or is gone: nothing is kept for a next time.
+            self.closed = True
+            return
         waiting = getattr(self, "_signin", None)
         if waiting is not None:
             waiting.cancel()  # nobody is left to take its answer

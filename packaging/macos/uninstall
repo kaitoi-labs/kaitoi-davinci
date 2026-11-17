@@ -1,0 +1,240 @@
+#!/bin/bash
+# Removes Kaitoi from DaVinci Resolve on this Mac.
+#
+# The installer puts this file in /Library/Application Support/Kaitoi/Resolve
+# as "Uninstall Kaitoi.command". Double-clicked, it opens in Terminal and asks
+# before it does anything. The Uninstall button in the Kaitoi window runs the
+# same file with --yes, which asks nothing.
+#
+#   "Uninstall Kaitoi.command"                    ask first, then remove
+#   "Uninstall Kaitoi.command" --yes              remove without asking
+#   "Uninstall Kaitoi.command" --yes --settings   and forget settings and history
+#
+# It ends with 0 when Kaitoi was removed, 1 when nothing was removed, and 3
+# when it was removed but something of it is still there; each thing left is
+# printed on a line that starts "Left in place: ".
+#
+# There are two parts to remove.
+#
+# Kaitoi's code, in /Library/Application Support/Kaitoi/Resolve, belongs to
+# the system, so macOS asks for an administrator's password. That is the only
+# step run as an administrator, and what it runs is written out below in
+# full: it takes nothing from a variable, from the environment or from a file
+# an ordinary account can write. It comes first, so that a password that is
+# not given leaves everything as it was.
+#
+# The rest is in the home folder of whoever runs this, and is removed as
+# them: the Kaitoi script and the Kaitoi effect Resolve lists, and the effects
+# Kaitoi made for their workflows and nodes. Only what Kaitoi made is taken:
+# an effect of someone else's in a Kaitoi folder stays, and so does the
+# folder. Nothing is deleted through a link: where a folder on the way down
+# from the Library is one, it leads somewhere that may be shared with other
+# people or other computers, and what is Kaitoi's there is named and left.
+# The installer puts nothing behind a link either. Results (Movies/Kaitoi by
+# default) and the Kaitoi sign-in, which other Kaitoi tools share, are never
+# touched.
+#
+# The whole of it is inside one function, read to its end before any of it
+# runs: this file is in the folder it deletes.
+
+set -u
+
+main() {
+    local yes=0 settings=0 arg answer
+    for arg in "$@"; do
+        case "$arg" in
+            --yes) yes=1 ;;
+            --settings) settings=1 ;;
+            *)
+                echo "usage: \"Uninstall Kaitoi.command\" [--yes] [--settings]"
+                return 2
+                ;;
+        esac
+    done
+
+    if [ "$(/usr/bin/id -u)" = "0" ]; then
+        echo "Run this as yourself, without sudo. It removes Kaitoi from your own DaVinci Resolve folder, and macOS asks for a password when one is needed."
+        return 1
+    fi
+    local home="${HOME:-}"
+    if [ -z "$home" ] || [ ! -d "$home/Library" ]; then
+        echo "Your home folder could not be found, so nothing was removed."
+        return 1
+    fi
+    cd / || return 1
+
+    # Kaitoi's code, for every account of this Mac. A test names a folder of
+    # its own to stand in for it, and removes that one as an ordinary user:
+    # the real one, and the password, are never reached from a test. The
+    # stand-in has to be named as the real one is, so that the name of some
+    # other folder, set by mistake, deletes nothing.
+    local shared="/Library/Application Support/Kaitoi/Resolve" testing=0
+    if [ -n "${KAITOI_TEST_SHARED:-}" ]; then
+        case "$KAITOI_TEST_SHARED" in
+            /*/Kaitoi/Resolve) ;;
+            *)
+                echo "KAITOI_TEST_SHARED is for this script's tests, and names a folder that ends in /Kaitoi/Resolve. Nothing was removed."
+                return 2
+                ;;
+        esac
+        shared="$KAITOI_TEST_SHARED"
+        testing=1
+    fi
+    local below="Application Support/Blackmagic Design/DaVinci Resolve/Fusion"
+    local fusion="$home/Library/$below"
+    local kept="$home/.kaitoi_resolve"
+
+    if [ "$yes" != "1" ]; then
+        echo "This removes Kaitoi from DaVinci Resolve on this Mac."
+        echo "Kaitoi's code is shared by every account of this Mac, so Kaitoi stops working in DaVinci Resolve for all of them."
+        echo "Your results and your Kaitoi sign-in are not touched."
+        echo
+        printf "Remove Kaitoi? [y/N] "
+        answer=""
+        read -r answer || true
+        case "$answer" in
+            y | Y | yes | Yes | YES) ;;
+            *)
+                echo "Nothing was removed."
+                return 1
+                ;;
+        esac
+        printf "Also remove your Kaitoi settings and the history of your runs? [y/N] "
+        answer=""
+        read -r answer || true
+        case "$answer" in
+            y | Y | yes | Yes | YES) settings=1 ;;
+        esac
+        echo
+    fi
+
+    local for_all=0
+    if [ -e "$shared" ] || [ -L "$shared" ]; then
+        for_all=1
+    elif [ "$testing" = "0" ] && /usr/sbin/pkgutil --pkg-info io.kaitoi.resolve-plugin >/dev/null 2>&1; then
+        for_all=1  # the folder was deleted by hand: the system still lists the package
+    fi
+    if [ "$for_all" = "1" ]; then
+        if [ "$yes" != "1" ]; then
+            echo "macOS now asks for your password, to remove Kaitoi's code."
+        fi
+        if [ "$testing" = "1" ]; then
+            if [ "${KAITOI_TEST_REFUSE:-0}" = "1" ] || ! /bin/rm -rf "$shared"; then
+                echo "Nothing was removed."
+                return 1
+            fi
+        elif ! /usr/bin/osascript -e 'do shell script "/bin/rm -rf \"/Library/Application Support/Kaitoi/Resolve\" && { /bin/rmdir \"/Library/Application Support/Kaitoi\"; /usr/sbin/pkgutil --forget io.kaitoi.resolve-plugin; /usr/bin/true; } >/dev/null 2>&1" with prompt "Kaitoi needs your password to remove its files from this Mac." with administrator privileges' >/dev/null 2>&1; then
+            echo "Nothing was removed: the password was not given, or Kaitoi's code could not be deleted."
+            return 1
+        fi
+    fi
+
+    local left=()
+
+    file_gone() {  # a file or a link of Kaitoi's. A folder of that name is someone else's, and stays.
+        if [ -d "$1" ] && [ ! -L "$1" ]; then
+            left+=("$1")
+            return 0
+        fi
+        /bin/rm -f "$1" 2>/dev/null
+        if [ -e "$1" ] || [ -L "$1" ]; then
+            left+=("$1")
+        fi
+    }
+
+    effects_gone() {  # one of the two folders Kaitoi keeps its effects in
+        local folder="$1" file
+        if [ -L "$folder" ]; then
+            left+=("$folder")  # a link leads somewhere that is not Kaitoi's to empty
+            return 0
+        fi
+        [ -d "$folder" ] || return 0
+        for file in "$folder"/*.setting; do
+            [ -f "$file" ] && [ ! -L "$file" ] || continue
+            # Every effect Kaitoi makes carries this name inside. One without it was put here by someone else.
+            /usr/bin/grep -q "KaitoiSpec" "$file" 2>/dev/null || continue
+            /bin/rm -f "$file" "${file%.setting}.png" 2>/dev/null
+        done
+        /bin/rm -f "$folder/.DS_Store" 2>/dev/null
+        /bin/rmdir "$folder" 2>/dev/null
+        if [ -e "$folder" ]; then
+            left+=("$folder")
+        fi
+    }
+
+    code_gone() {  # the copy of the code an install from the plugin's own folder left beside the script
+        /bin/rm -rf "$1" 2>/dev/null
+        if [ -e "$1" ] || [ -L "$1" ]; then
+            left+=("$1")
+        fi
+    }
+
+    through_a_link() {  # is the Library, or any folder on the way from it down to "$1", a link?
+        local path="$home/Library" rest="$1" part
+        if [ -L "$path" ]; then
+            return 0
+        fi
+        while [ -n "$rest" ]; do
+            part="${rest%%/*}"
+            if [ "$part" = "$rest" ]; then
+                rest=""
+            else
+                rest="${rest#*/}"
+            fi
+            path="$path/$part"
+            if [ -L "$path" ]; then
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    clear_folder() {  # $1: a folder below Fusion. The rest: what is Kaitoi's in it, each "file:", "effects:" or "code:" and a name.
+        local folder="$1" item
+        shift
+        if through_a_link "$below/$folder"; then
+            for item in "$@"; do
+                if [ -e "$fusion/$folder/${item#*:}" ] || [ -L "$fusion/$folder/${item#*:}" ]; then
+                    left+=("$fusion/$folder/${item#*:}")
+                fi
+            done
+            return 0
+        fi
+        for item in "$@"; do
+            case "$item" in
+                file:*) file_gone "$fusion/$folder/${item#*:}" ;;
+                effects:*) effects_gone "$fusion/$folder/${item#*:}" ;;
+                code:*) code_gone "$fusion/$folder/${item#*:}" ;;
+            esac
+        done
+    }
+
+    clear_folder "Scripts/Edit" "file:Kaitoi.py" "file:Kaitoi Video.py" "code:kaitoi_resolve"
+    clear_folder "Templates/Edit/Generators" "file:Kaitoi.setting" "effects:Kaitoi"
+    clear_folder "Templates/Edit/Effects" "file:Kaitoi.setting" "effects:Kaitoi"
+
+    if [ "$settings" = "1" ]; then
+        # Twice: the Kaitoi window may write one last small file into the
+        # folder while it is being emptied, and the folder then stays.
+        /bin/rm -rf "$kept" 2>/dev/null || /bin/rm -rf "$kept" 2>/dev/null
+        if [ -e "$kept" ] || [ -L "$kept" ]; then
+            left+=("$kept")
+        fi
+    else
+        # The list of effects Kaitoi has in Resolve. They are gone, so the
+        # list goes too; every setting beside it stays.
+        /bin/rm -f "$kept/templates.json" 2>/dev/null
+    fi
+
+    echo "Kaitoi was removed. Restart DaVinci Resolve to clear it from the menus."
+    if [ "${#left[@]}" -gt 0 ]; then
+        for arg in "${left[@]}"; do
+            echo "Left in place: $arg"
+        done
+        return 3
+    fi
+    return 0
+}
+
+main "$@"
+exit $?

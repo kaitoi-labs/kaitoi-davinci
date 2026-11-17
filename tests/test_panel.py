@@ -12,7 +12,7 @@ import time
 import unittest
 from unittest import mock
 
-from kaitoi_resolve import api, config, tools, ui
+from kaitoi_resolve import api, busy, config, tools, ui, uninstall
 
 from .fake_kaitoi import fake_jpeg
 from .fake_panel import FinishedLoader, Tree, Widget, boxes, panel, row_of
@@ -1640,6 +1640,278 @@ class SigningIn(Base):
             with mock.patch.object(ui.credentials, "env_api_key", lambda: "k"):
                 made._show_account_info()
                 self.assertEqual(made._shown[("SignOut", "Enabled")], False)
+
+
+class Uninstalling(Base):
+    """The Uninstall button: what the window does around the uninstaller, which is stood in for here."""
+
+    GONE = "Kaitoi was removed from this Mac.\nRestart DaVinci Resolve to clear it from the menus."
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(config.leave_gone, False)
+        self.made = panel()
+        self.addCleanup(busy.release, self.made._owner)
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        # A file that is really there: the window tells an uninstall that happened from one that did not by whether it still is.
+        self.script = os.path.join(folder.name, "Uninstall Kaitoi.command")
+        with open(self.script, "w", encoding="utf-8") as fh:
+            fh.write("never run: uninstall.run is stood in for")
+        self.made._uninstaller = self.script
+        self.made.balance = ""
+        self.made.view = ui.VIEW_ACCOUNT
+        self.ran = []
+        self.hold = threading.Event()  # the password is being asked for until this is set
+        self.hold.set()
+        self.answer = (uninstall.REMOVED, [])
+
+        def run(path, *, settings):
+            self.ran.append((path, settings))
+            self.assertTrue(self.hold.wait(10))
+            if self.deletes_itself:
+                os.remove(path)  # as the real one does: it is in the folder it deletes
+            if isinstance(self.answer, Exception):
+                raise self.answer
+            return self.answer
+
+        self.deletes_itself = False
+
+        stood_in = mock.patch.object(uninstall, "run", run)
+        stood_in.start(); self.addCleanup(stood_in.stop)
+        # Nothing else of the window may move while Kaitoi is being removed, or after.
+        for name in ("_collect_loader", "_follow_timeline", "_save_geometry", "_read_columns"):
+            still = mock.patch.object(ui.Panel, name, side_effect=AssertionError(name + " ran"))
+            still.start(); self.addCleanup(still.stop)
+
+    def finish(self):
+        """Let the uninstaller answer, and the window take the answer."""
+        state = self.made._uninstall
+        self.hold.set()
+        self.assertTrue(state["done"].wait(10))
+        return self.made._on_tick()
+
+    def text(self):
+        return self.made._shown.get(("UninstallText", "Text"))
+
+    def stage(self):
+        return self.made.items["UninstallStage"].CurrentIndex
+
+    def nav(self):
+        """Whether each tab can be pressed. One that was never switched off can."""
+        return [self.made.items[button_id]._values.get("Enabled", True) for button_id, _, _, _ in ui.NAV]
+
+    def on_show(self):
+        """The view the window is on, as it believes and as it drew it."""
+        self.assertEqual(self.made.items["Views"].CurrentIndex, self.made.view)
+        return self.made.view
+
+    def test_the_button_only_asks_and_cancel_goes_back(self):
+        made = self.made
+        made.items["UninstallSettings"].Checked = True  # left ticked by a question that was cancelled
+        made._uninstall_pressed()
+        self.assertEqual(self.on_show(), ui.VIEW_UNINSTALL)
+        self.assertEqual(self.stage(), ui.STAGE_ASK)
+        self.assertTrue(self.text().startswith("Uninstall Kaitoi?"))
+        self.assertIn("so it stops working for every account", self.text())
+        self.assertIn("Your results and your Kaitoi sign-in stay.", self.text())
+        self.assertFalse(made.items["UninstallSettings"].Checked, "settings are kept unless ticked this time")
+        self.assertGreater(made._shown[("UninstallText", "MinimumSize")][1], 5 * 15, "room for every line: a wrapping label is one line high by itself")
+        self.assertEqual(self.nav(), [True] * len(ui.NAV), "a tab still leads away: nothing has started")
+        made._uninstall_cancelled()
+        self.assertEqual(self.on_show(), ui.VIEW_ACCOUNT)
+        self.assertEqual(self.ran, [], "nothing was removed by asking")
+        self.assertFalse(config._quiet)
+
+    def test_it_waits_for_whatever_kaitoi_is_still_doing_and_says_what(self):
+        made = self.made
+
+        class Working:
+            running = True
+
+        class Landed:
+            """A run whose result has arrived and is placed on the next tick: paid for, and not yet on the timeline."""
+            running = False
+
+        for name, value, why in (
+            ("job", Working(), "A run is still going. Wait for it or cancel it, then uninstall."),
+            ("job", Landed(), "A run is still going. Wait for it or cancel it, then uninstall."),
+            ("_bulk", {"stop": threading.Event()}, "An install is still running. Stop it first, then uninstall."),
+            ("_signin", object(), "A sign-in is still waiting. Finish it first, then uninstall."),
+            ("loader", Working(), "Kaitoi is still loading your workflows. Try again in a moment."),
+        ):
+            setattr(made, name, value)
+            made._uninstall_pressed()
+            self.assertEqual(made.view, ui.VIEW_ACCOUNT, name)
+            self.assertEqual(made.items["Status"].Text, why)
+            # And when it started after the question was put:
+            setattr(made, name, None)
+            made.status("")
+            made._uninstall_pressed()
+            self.assertEqual(made.view, ui.VIEW_UNINSTALL)
+            setattr(made, name, value)
+            made._uninstall_confirmed()
+            self.assertEqual(self.ran, [], name)
+            self.assertIsNone(made._uninstall)
+            self.assertEqual(self.on_show(), ui.VIEW_ACCOUNT)
+            self.assertEqual(made.items["Status"].Text, why)
+            setattr(made, name, None)
+            made.status("")
+        self.assertFalse(config._quiet)
+        self.assertIsNone(busy.holder(), "and nothing was announced to the other scripts")
+        self.assertEqual(self.nav(), [True] * len(ui.NAV))
+
+    def test_it_waits_for_a_run_started_from_the_inspector_too(self):
+        """That run belongs to another script, which this window only knows of by the marker it leaves."""
+        made = self.made
+        why = "A run started from the Inspector is still going. Wait for it, then uninstall."
+        self.assertTrue(busy.acquire("the script of a Generate in the Inspector", "Rain"))
+        self.addCleanup(busy.release, "the script of a Generate in the Inspector")
+        made._uninstall_pressed()
+        self.assertEqual(made.view, ui.VIEW_ACCOUNT)
+        self.assertEqual(made.items["Status"].Text, why)
+        made.view = ui.VIEW_UNINSTALL  # the question was put before that run began
+        made._uninstall_confirmed()
+        self.assertEqual(self.ran, [])
+        self.assertIsNone(made._uninstall)
+        self.assertEqual(busy.holder()["what"], "Rain", "the run's own marker is left alone")
+
+    def test_no_run_can_start_from_the_inspector_while_kaitoi_is_being_removed(self):
+        """The window holds the marker a run holds, and keeps it fresh however long the password takes."""
+        made = self.made
+        self.hold.clear()
+        made._uninstall_pressed()
+        made._uninstall_confirmed()
+        self.assertEqual(busy.held_by_other("the script of a Generate in the Inspector"), "the uninstaller")
+        self.assertFalse(busy.acquire("the script of a Generate in the Inspector", "Rain"), "a Generate pressed now is refused")
+        with mock.patch.object(ui.busy, "renew") as renewed:
+            self.assertTrue(made._on_tick())
+        renewed.assert_called_once_with(made._owner)
+        self.answer = (uninstall.NOTHING, [])
+        self.finish()
+        self.assertIsNone(busy.holder(), "let go when the password was not given")
+        self.hold.set()
+        self.answer = (uninstall.REMOVED, [])
+        made._uninstall_pressed()
+        made._uninstall_confirmed()
+        self.finish()
+        self.assertTrue(made._removed)
+        self.assertIsNone(busy.holder(), "and when Kaitoi is gone")
+
+    def test_nothing_starts_unless_the_question_is_on_show(self):
+        made = self.made
+        for view in (ui.VIEW_ACCOUNT, ui.VIEW_BROWSE, ui.VIEW_RUN, ui.VIEW_HISTORY):
+            made.view = view
+            made._uninstall_confirmed()
+        self.assertEqual(self.ran, [])
+        self.assertIsNone(made._uninstall)
+        self.assertFalse(config._quiet)
+
+    def test_while_the_password_is_asked_for_the_window_holds_one_message_and_writes_nothing(self):
+        made = self.made
+        self.hold.clear()
+        made._uninstall_pressed()
+        made._uninstall_confirmed()
+        self.assertEqual(self.on_show(), ui.VIEW_UNINSTALL)
+        self.assertEqual(self.text(), "Removing Kaitoi. macOS asks for your password.")
+        self.assertEqual(self.stage(), ui.STAGE_WAIT, "no button under it: neither a second Uninstall nor a Close")
+        self.assertEqual(self.nav(), [False] * len(ui.NAV), "no tab leads away from it")
+        self.assertTrue(config._quiet, "what the uninstaller deletes is not put back behind it")
+        self.assertTrue(made._on_tick(), "still waiting; and nothing else of the window ran, or setUp's stand-ins would have said so")
+        made._uninstall_confirmed()
+        made._uninstall_cancelled()
+        self.assertEqual(len(self.ran), 1, "a second press starts no second uninstaller")
+        self.assertEqual(self.on_show(), ui.VIEW_UNINSTALL, "and Cancel does not lead away once it has started")
+        made.closed = False
+        made._on_close()
+        self.assertTrue(made.closed, "closed while it waits, the window saves nothing")
+        self.finish()
+
+    def test_when_kaitoi_is_gone_the_window_says_so_and_can_only_be_closed(self):
+        made = self.made
+        made._uninstall_pressed()
+        made._uninstall_confirmed()
+        self.assertFalse(self.finish())
+        self.assertEqual(self.ran, [(self.script, False)])
+        self.assertTrue(made._removed)
+        self.assertEqual(self.text(), self.GONE)
+        self.assertEqual(self.stage(), ui.STAGE_GONE)
+        self.assertEqual(self.nav(), [False] * len(ui.NAV))
+        self.assertEqual(self.on_show(), ui.VIEW_UNINSTALL)
+        self.assertTrue(config._quiet, "and stays quiet: its folder is not made again")
+        self.assertFalse(made._on_tick(), "nothing moves afterwards either")
+        made._uninstall_confirmed()
+        made._uninstall_cancelled()
+        self.assertEqual(len(self.ran), 1)
+        self.assertEqual(self.on_show(), ui.VIEW_UNINSTALL)
+        made.closed = False
+        made._on_close()
+        self.assertTrue(made.closed)
+
+    def test_the_tick_box_also_removes_settings_and_history(self):
+        made = self.made
+        made._uninstall_pressed()
+        made.items["UninstallSettings"].Checked = True
+        made._uninstall_confirmed()
+        self.finish()
+        self.assertEqual(self.ran, [(self.script, True)])
+
+    def test_what_could_not_be_removed_is_listed(self):
+        made = self.made
+        self.answer = (uninstall.LEFT, ["/Users/someone/Library/a folder/Kaitoi", "/Users/someone/.kaitoi_resolve"])
+        made._uninstall_pressed()
+        made._uninstall_confirmed()
+        self.finish()
+        self.assertTrue(made._removed, "Kaitoi itself is gone")
+        self.assertEqual(self.text(), self.GONE + "\n\nThese were left in place:\n/Users/someone/Library/a folder/Kaitoi\n/Users/someone/.kaitoi_resolve")
+        self.assertEqual(self.stage(), ui.STAGE_GONE)
+        self.assertGreater(made._shown[("UninstallText", "MinimumSize")][1], 5 * 15, "room for each of its lines")
+
+    def test_a_password_that_is_not_given_puts_the_window_back_as_it_was(self):
+        for answer in ((uninstall.NOTHING, []), (2, []), (127, []), OSError("it could not be started")):
+            made = self.made
+            self.answer = answer
+            made._uninstall_pressed()
+            made._uninstall_confirmed()
+            self.assertEqual(self.stage(), ui.STAGE_WAIT)
+            self.assertFalse(self.finish())
+            self.assertFalse(made._removed, answer)
+            self.assertIsNone(made._uninstall)
+            self.assertEqual(self.on_show(), ui.VIEW_ACCOUNT)
+            self.assertEqual(self.nav(), [True] * len(ui.NAV))
+            self.assertEqual(made.items["Status"].Text, "Nothing was removed.")
+            self.assertFalse(config._quiet, "the window writes again")
+        self.assertEqual(len(self.ran), 4)
+
+    def test_an_answer_lost_on_the_way_does_not_hide_an_uninstall_that_happened(self):
+        """The uninstaller is in the folder it deletes. When it is gone, Kaitoi is gone, whatever came back from it."""
+        for answer in (UnicodeDecodeError("ascii", b"\xc3", 0, 1, "its words could not be read"), (-9, []), (uninstall.NOTHING, [])):
+            with open(self.script, "w", encoding="utf-8") as fh:
+                fh.write("put back for the next case")
+            made = self.made = panel()
+            made._uninstaller, made.balance, made.view = self.script, "", ui.VIEW_ACCOUNT
+            self.answer, self.deletes_itself = answer, True
+            made._uninstall_pressed()
+            made._uninstall_confirmed()
+            self.finish()
+            self.assertTrue(made._removed, answer)
+            self.assertEqual(self.text(), self.GONE)
+            self.assertEqual(self.stage(), ui.STAGE_GONE)
+            self.assertEqual(self.nav(), [False] * len(ui.NAV))
+            self.assertTrue(config._quiet, "the window does not start writing again with its code gone")
+            config.leave_gone(False)
+
+    def test_a_copy_of_the_plugin_without_an_uninstaller_has_no_button(self):
+        made = self.made
+        made._uninstaller = None
+        made.view = ui.VIEW_UNINSTALL  # however it got there
+        made._uninstall_confirmed()
+        self.assertEqual(self.ran, [])
+        self.assertIsNone(made._uninstall)
+        with open(ui.__file__, encoding="utf-8") as fh:
+            source = fh.read()
+        self.assertIn('*([ui.Button({"ID": "Uninstall", "Text": "Uninstall Kaitoi", "Weight": 0.0, "StyleSheet": STYLE_QUIET})] if self._uninstaller else []),', source, "the button is drawn only where there is an uninstaller")
+        self.assertIn("        if self._uninstaller:\n            events.Uninstall.Clicked = lambda ev: self._uninstall_pressed()\n", source)
 
 
 class SigningOutOnRealEffectFiles(Base):
