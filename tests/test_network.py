@@ -12,7 +12,7 @@ from unittest import mock
 
 import threading
 
-from kaitoi_resolve import api, config, graphs, pipeline, templates, tools
+from kaitoi_resolve import api, config, graphs, pipeline, templates, tools, ui
 
 from .fake_kaitoi import NODE_DETAILS, FakeKaitoi, fake_jpeg, fake_png
 
@@ -52,6 +52,85 @@ class Base(unittest.TestCase):
 
 
 class Listing(Base):
+    def test_each_page_of_nodes_is_handed_over_as_it_arrives(self):
+        pages = []
+        everything = api.list_node_types(self.cfg, page_size=2, on_page=lambda page: pages.append([node["type"] for node in page]))
+        self.assertGreater(len(pages), 1, "the test server sends two nodes to a page")
+        self.assertEqual([node_type for page in pages for node_type in page], [node["type"] for node in everything], "every node once, in the order sent")
+        asked = [entry for entry in self.server.seen if entry["path"].split("?")[0] == "/api/v1/node-types"]
+        self.assertEqual(len(asked), len(pages), "one request to a page, and a page handed over after each")
+        listed = []
+        nodes = tools.load_node_catalog(self.cfg, on_page=lambda page: listed.append([node.id for node in page]))
+        self.assertEqual([node_id for page in listed for node_id in page], [node.id for node in nodes], "as nodes, the same as the whole list")
+        self.assertTrue(any("/loaders/" in node["type"] for node in everything), "the server lists a plain loader")
+        self.assertFalse([node_id for page in listed for node_id in page if "/loaders/" in node_id], "and no page hands one over")
+
+    def test_a_name_that_cannot_be_looked_up_for_a_moment_is_tried_again(self):
+        """Several thumbnails start at once, and the lookup of the server's name then fails now and again. Nothing was sent, so nothing is lost by asking again."""
+        import socket
+        import urllib.error
+        import urllib.request
+
+        real, calls = urllib.request.urlopen, []
+
+        def flaky(failures):
+            def urlopen(request, timeout=None):
+                calls.append(request.full_url)
+                if len(calls) <= failures:
+                    raise urllib.error.URLError(socket.gaierror(8, "nodename nor servname provided, or not known"))
+                return real(request, timeout=timeout)
+            return urlopen
+
+        link = f"{self.server.url}/api/v1/node-type-thumbnails/builtin/x?token=signed&size=256&format=jpeg"
+        target = self.temp_file("looked-up.jpg", b"")
+        with mock.patch.object(api.time, "sleep") as waited:
+            for failures in (1, api.NAME_LOOKUP_TRIES - 1):
+                calls.clear()
+                with mock.patch.object(urllib.request, "urlopen", flaky(failures)):
+                    api.download_to(target, link)
+                self.assertEqual(len(calls), failures + 1)
+                with open(target, "rb") as fh:
+                    self.assertEqual(fh.read(3), b"\xff\xd8\xff")
+            self.assertEqual(waited.call_count, 1 + api.NAME_LOOKUP_TRIES - 1, "a short wait before each new try")
+            calls.clear()
+            with mock.patch.object(urllib.request, "urlopen", flaky(99)), self.assertRaises(api.KaitoiAPIError) as raised:
+                api.download_to(target, link)
+            self.assertEqual((raised.exception.code, len(calls)), ("NETWORK", api.NAME_LOOKUP_TRIES), "a name that stays unknown is given up on")
+            # Anything else that goes wrong is not asked for twice: the server has answered, or the line broke part way.
+            calls.clear()
+
+            def refused(request, timeout=None):
+                calls.append(request.full_url)
+                raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+
+            with mock.patch.object(urllib.request, "urlopen", refused), self.assertRaises(api.KaitoiAPIError):
+                api.download_to(target, link)
+            self.assertEqual(len(calls), 1)
+        self.assertEqual([name for name in os.listdir(self.dir.name) if name.endswith(".part")], [], "and no half-written file is left by any of it")
+
+    def test_a_link_with_a_space_in_it_is_sent_with_the_space_escaped(self):
+        """Kaitoi puts a node's name into the link to its thumbnail as it is, and a name can have a space."""
+        self.assertEqual(api.web_address("https://kaitoi.example/api/v1/node-type-thumbnails/user/My Node/x?token=a+b/c%3D=&size=256"),
+                         "https://kaitoi.example/api/v1/node-type-thumbnails/user/My%20Node/x?token=a+b/c%3D=&size=256")
+        signed = "https://storage.example/bucket/a%20b/file.jpg?X-Amz-Signature=abc123&X-Amz-Credential=k%2F20260101%2Fus-east-1"
+        self.assertEqual(api.web_address(signed), signed, "a link that was already legal is not touched: it is the one that was signed")
+        for as_it_came in ("https://b\u00fccher.example/a/b?c=d", "https://[2001:db8::1]:8443/a?b=c", "/api/v1/files/f1/content", "https://kaitoi.example/a<b>{c}|d^e`f\"g\\h",
+                           "https://kaitoi.example", "https://user@kaitoi.example:8443/p?q=1#frag"):
+            self.assertEqual(api.web_address(as_it_came), as_it_came, "only what a request cannot carry is escaped, and never the host")
+        self.assertEqual(api.web_address("https://b\u00fccher.example/caf\u00e9 au lait?q=\u00e9"), "https://b\u00fccher.example/caf%C3%A9%20au%20lait?q=%C3%A9")
+        self.assertEqual(api.web_address("/api/v1/node-type-thumbnails/user/My Node/x"), "/api/v1/node-type-thumbnails/user/My%20Node/x")
+        self.assertTrue(api._same_origin(api.web_address("https://b\u00fccher.example/files/my file.mp4"), "https://b\u00fccher.example"), "a file on the API's own host is still known as that")
+        # A link no request can be made from is the same kind of failure as before, not an error of another kind.
+        for broken in ("http://[::1/a b", "http://exa\tmple.example/a b"):
+            with self.assertRaises(api.KaitoiAPIError) as raised:
+                api.download_to(self.temp_file("never-written.jpg", b""), broken)
+            self.assertEqual(raised.exception.code, "NETWORK", broken)
+        target = self.temp_file("picture.jpg", b"")
+        api.download_to(target, f"{self.server.url}/api/v1/node-type-thumbnails/user/My Node/x?token=signed&size=256&format=jpeg")
+        self.assertEqual(self.server.seen[-1]["path"].split("?")[0], "/api/v1/node-type-thumbnails/user/My%20Node/x")
+        with open(target, "rb") as fh:
+            self.assertEqual(fh.read(3), b"\xff\xd8\xff")
+
     def test_templates_follow_the_cursor_to_the_end(self):
         found = api.list_templates(self.cfg, page_size=1)
         self.assertEqual([t["name"] for t in found], ["Rain", "Looks"])
@@ -438,8 +517,37 @@ class Thumbnails(Base):
                 self.assertEqual(len(self.pictures()), 1, "after a week it is asked for once more")
                 self.assertEqual(self.names(), sorted([os.path.basename(path), os.path.basename(tools.tile_path(rain))]), "and the note goes when the cut arrives")
 
+    def test_a_thumbnail_kaitoi_says_not_now_to_is_asked_for_again_after_the_wait(self):
+        """Too many requests from this address in a minute, or too many thumbnails being made at once: not a refusal of the picture."""
+        rain = self.rain()
+        self.server.thumbnails_too_many = 1
+        with self.assertRaises(tools.ComeBackLater) as later:
+            tools.fetch_thumbnail(self.cfg, rain)
+        self.assertEqual(later.exception.seconds, 7, "as long as Kaitoi asked for")
+        self.assertEqual(self.names(), [], "nothing half-fetched is left")
+        self.assertNotIn(rain.id, tools._thumbnails_refused, "it is not given up on for the session")
+        path = tools.fetch_thumbnail(self.cfg, rain)
+        self.assertEqual(self.names(), [os.path.basename(path)])
+        # The same for the cut of a square picture: the thumbnail is kept, and only the cut is asked for again.
+        for status, wait in ((429, tools.RATE_LIMIT_WAIT_SECONDS), (503, tools.RATE_LIMIT_WAIT_SECONDS)):
+            with self.subTest(status=status):
+                for name in self.names():
+                    os.remove(os.path.join(tools.thumbnail_dir(), name))
+                self.new_session()
+                self.server.png_status = status
+                with self.assertRaises(tools.ComeBackLater) as later:
+                    self.square()
+                self.assertEqual(later.exception.seconds, wait, "Kaitoi did not say how long: a wait of the plugin's own")
+                rain = self.rain()
+                self.assertEqual(self.names(), [os.path.basename(tools.thumbnail_path(rain))], "the thumbnail itself arrived, and there is no note that it has no cut")
+                self.server.png_status = None
+                self.server.seen.clear()
+                self.assertEqual(tools.fetch_thumbnail(self.cfg, rain), tools.thumbnail_path(rain))
+                self.assertEqual(len(self.pictures()), 1, "one request, for the cut: the thumbnail is not fetched twice")
+                self.assertEqual(tools.thumbnail_tile(rain), tools.tile_path(rain))
+
     def test_a_cut_that_failed_for_a_passing_reason_is_asked_for_next_time(self):
-        for status in (429, 503, 401, 403, 408):  # busy, down, or a link that has run out
+        for status in (401, 403, 408):  # a link that has run out, or a request that took too long
             with self.subTest(status=status):
                 for name in self.names():
                     os.remove(os.path.join(tools.thumbnail_dir(), name))
@@ -561,7 +669,8 @@ class Thumbnails(Base):
         self.server.thumbnail_bytes = fake_jpeg(256, 256) + b"newer"
         self.server.png_status = 503
         self.new_session()
-        tools.fetch_thumbnail(self.cfg, node)
+        with self.assertRaises(tools.ComeBackLater):
+            tools.fetch_thumbnail(self.cfg, node)
         self.assertIsNone(tools.thumbnail_tile(node), "the icon, not the picture from before")
         self.assertEqual(self.names(), [os.path.basename(path)])
         # Next time the cut is made; then the picture changes to one that needs none.
@@ -691,6 +800,63 @@ class Thumbnails(Base):
         self.server.seen.clear()
         self.assertIsNone(tools.fetch_thumbnail(self.cfg, bare))
         self.assertEqual(self.server.seen, [])
+
+
+
+class TheLoaderAgainstAServer(Base):
+    """ui.Loader with nothing stood in for but the server: the lists, the files on disk, and what it counts."""
+
+    def setUp(self):
+        super().setUp()
+        self.server.node_thumbnails = True
+
+    def load(self):
+        loader = ui.Loader(self.cfg, None)
+        self.addCleanup(loader.stop)
+        taken = {"nodes": None, "complete": False, "thumbnails": [], "pages": 0}
+        loader.start()
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            finished = loader.done and not loader.running
+            fresh = loader.take()
+            if fresh["nodes"] is not None:
+                taken["nodes"], taken["pages"] = fresh["nodes"], taken["pages"] + 1
+                taken["complete"] = taken["complete"] or fresh["nodes_complete"]
+            taken["thumbnails"] += fresh["thumbnails"]
+            if finished:
+                return loader, taken
+            time.sleep(0.01)
+        self.fail("the loader did not end")
+
+    def test_the_lists_arrive_and_every_thumbnail_is_on_disk_and_counted_as_sent(self):
+        loader, taken = self.load()
+        wanted = [node for node in taken["nodes"] if node.thumbnail_url]
+        self.assertTrue(taken["complete"])
+        self.assertGreaterEqual(len(wanted), 2, "the test server gives every node a thumbnail")
+        self.assertEqual(len(taken["thumbnails"]), len(wanted) + 1, "one for each node, and the workflow's")
+        for _, path in taken["thumbnails"]:
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(3), b"\xff\xd8\xff")
+        self.assertEqual(loader._arrived, len(wanted) + 1, "each was asked of the server and written: that is what tells it the server answers")
+        self.assertFalse(loader._gave_up)
+        # Loaded again, with everything on disk: handed over as before, and nothing asked of the server.
+        self.server.seen.clear()
+        again, taken = self.load()
+        self.assertEqual(len(taken["thumbnails"]), len(wanted) + 1)
+        self.assertEqual([entry for entry in self.server.seen if "-thumbnails/" in entry["path"]], [])
+        self.assertEqual(again._arrived, 0, "a thumbnail kept on disk says nothing about the server")
+
+    def test_told_to_come_back_it_waits_as_long_as_asked_and_then_has_them_all(self):
+        self.server.thumbnails_too_many = 2
+        with mock.patch.object(tools, "_retry_wait", lambda details: 0.2 if (details or {}).get("retryAfterSeconds") == "7" else 99):
+            began = time.time()
+            loader, taken = self.load()
+        wanted = [node for node in taken["nodes"] if node.thumbnail_url]
+        self.assertEqual(len(taken["thumbnails"]), len(wanted) + 1, "the two that were told to come back came back")
+        self.assertGreaterEqual(time.time() - began, 0.2, "after the wait the server asked for")
+        self.assertFalse(loader._gave_up)
+        said = [call.args[0] for call in config.log.call_args_list]
+        self.assertTrue([line for line in said if line.startswith("Kaitoi asked for fewer requests: thumbnails wait")])
 
 
 class InstallMany(Base):

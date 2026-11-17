@@ -1642,6 +1642,790 @@ class SigningIn(Base):
                 self.assertEqual(made._shown[("SignOut", "Enabled")], False)
 
 
+def pictured(name, origin="builtin"):
+    """A node that has a thumbnail to fetch."""
+    made = makes(name, "image")
+    return tools.replace(made, thumbnail_url=f"https://kaitoi.example/thumbnails/{name}?token=signed", origin=origin)
+
+
+class LoadingTheLists(Base):
+    """ui.Loader over stand-ins for what it fetches: what it hands over, when, and in what order."""
+
+    def setUp(self):
+        super().setUp()
+        self.pages = [[pictured("a1"), pictured("a2")], [pictured("b1"), pictured("b2")]]
+        self.gate = threading.Event()  # the pages after the first wait for this
+        self.gate.set()
+        self.fetched = []  # thumbnails in the order they were asked for
+        self.at_once = self.most_at_once = 0
+        self.fetching = threading.Lock()
+        self.hold_pictures = threading.Event()
+        self.hold_pictures.set()
+        self.workflows = []
+
+        def catalog(cfg, *, should_stop=None, on_page=None):
+            everything = []
+            for at, page in enumerate(self.pages):
+                if at:
+                    self.assertTrue(self.gate.wait(10))
+                if should_stop is not None and should_stop():
+                    raise api.KaitoiAPIError(0, "ABORTED", "stopped by user")
+                everything.extend(page)
+                on_page(page)
+            return everything
+
+        self.kept = set()  # thumbnails on disk: the real fetch writes a file, and the loader asks whether it is there
+
+        def thumbnail(cfg, tool):
+            with self.fetching:
+                self.fetched.append(tool.name)
+                self.at_once += 1
+                self.most_at_once = max(self.most_at_once, self.at_once)
+            self.assertTrue(self.hold_pictures.wait(10))
+            time.sleep(0.02)
+            with self.fetching:
+                self.at_once -= 1
+                self.kept.add(tool.name)
+            return f"/pictures/{tool.name}.jpg"
+
+        for target, name, stand_in in ((tools, "load_workflow_tools", lambda cfg, known, should_stop=None: (list(self.workflows), {"templates": []})),
+                                       (tools, "load_node_catalog", catalog), (tools, "fetch_thumbnail", thumbnail), (tools, "drop_replaced_thumbnails", lambda found: 0),
+                                       (tools, "thumbnail_kept", lambda tool: tool.name in self.kept),
+                                       (api, "account_credits", lambda cfg: {}), (api, "balance_text", lambda credits: "12 credits")):
+            stood_in = mock.patch.object(target, name, stand_in)
+            stood_in.start(); self.addCleanup(stood_in.stop)
+        self.addCleanup(self.gate.set)
+        self.addCleanup(self.hold_pictures.set)
+
+    def loader(self):
+        made = ui.Loader(api.Config("k", "http://127.0.0.1:9"), None)
+        self.addCleanup(made.stop)
+        return made
+
+    def until(self, loader, wanted, taken=None):
+        """Take from the loader, as the window does on every tick, until ``wanted`` says it has seen enough. Returns everything taken."""
+        taken = taken if taken is not None else []
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            taken.append(loader.take())
+            if wanted(taken):
+                return taken
+            time.sleep(0.01)
+        self.fail("the loader never handed that over")
+
+    def finished(self, loader):
+        deadline = time.time() + 10
+        while loader.running and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(loader.running)
+        self.assertTrue(loader.done)
+
+    def test_the_first_page_of_nodes_is_handed_over_before_the_last_has_arrived(self):
+        self.gate.clear()
+        loader = self.loader()
+        loader.start()
+        taken = self.until(loader, lambda taken: taken[-1]["nodes"] is not None)
+        self.assertEqual([node.name for node in taken[-1]["nodes"]], ["a1", "a2"])
+        self.assertFalse(taken[-1]["nodes_complete"], "there is more to come: nothing may be taken off the list on the strength of this")
+        self.assertTrue(loader.running)
+        time.sleep(0.05)
+        self.assertIsNone(loader.take()["nodes"], "the same page is not handed over twice")
+        self.gate.set()
+        taken = self.until(loader, lambda taken: taken[-1]["nodes_complete"])
+        self.assertEqual([node.name for node in taken[-1]["nodes"]], ["a1", "a2", "b1", "b2"], "the catalog as far as it has come, the earlier pages included")
+        self.finished(loader)
+        self.assertFalse(loader.take()["nodes_complete"], "said once, with the list it is true of")
+
+    def test_the_last_page_taken_together_with_the_end_still_says_it_is_all(self):
+        """The window may look only after everything has arrived, as it does when the lists come fast."""
+        loader = self.loader()
+        loader.start()
+        self.finished(loader)
+        fresh = loader.take()
+        self.assertEqual([node.name for node in fresh["nodes"]], ["a1", "a2", "b1", "b2"])
+        self.assertTrue(fresh["nodes_complete"])
+        self.assertEqual(fresh["balance"], "12 credits")
+        self.assertEqual(sorted(tool_id for tool_id, _ in fresh["thumbnails"]), sorted(node.id for page in self.pages for node in page))
+
+    def test_a_catalog_that_breaks_off_is_never_called_complete(self):
+        def broken(cfg, *, should_stop=None, on_page=None):
+            on_page(self.pages[0])
+            raise api.KaitoiAPIError(503, "UNAVAILABLE", "the second page did not come")
+
+        with mock.patch.object(tools, "load_node_catalog", broken):
+            loader = self.loader()
+            loader.start()
+            self.finished(loader)
+        fresh = loader.take()
+        self.assertEqual([node.name for node in fresh["nodes"]], ["a1", "a2"], "what did arrive is still listed")
+        self.assertFalse(fresh["nodes_complete"], "and the list kept from last time is not replaced by half a catalog")
+
+    def test_thumbnails_are_fetched_several_at_a_time_and_each_only_once(self):
+        self.pages = [[pictured(f"n{at:02}") for at in range(20)], [pictured(f"m{at:02}") for at in range(20)]]
+        self.hold_pictures.clear()
+        loader = self.loader()
+        loader.start()
+        deadline = time.time() + 10
+        while self.at_once < ui.THUMBNAIL_FETCHERS and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.at_once, ui.THUMBNAIL_FETCHERS, "as many at once as there are threads for it, and no more")
+        self.hold_pictures.set()
+        self.finished(loader)
+        self.assertEqual(self.most_at_once, ui.THUMBNAIL_FETCHERS)
+        self.assertGreaterEqual(ui.THUMBNAIL_FETCHERS, 2, "several at once: one at a time, three hundred took over two minutes")
+        self.assertLessEqual(ui.THUMBNAIL_FETCHERS, 4, "and no more than Kaitoi answers at a time for one address: the rest would only wait in line there")
+        self.assertEqual(sorted(self.fetched), sorted(node.name for page in self.pages for node in page), "every one, and none twice")
+        self.assertEqual(len(loader.take()["thumbnails"]), 40)
+
+    def test_thumbnails_start_while_the_node_list_is_still_arriving(self):
+        self.gate.clear()
+        loader = self.loader()
+        loader.start()
+        self.until(loader, lambda taken: sum(len(fresh["thumbnails"]) for fresh in taken) == 2)
+        self.assertEqual(sorted(self.fetched), ["a1", "a2"], "the first page's pictures are not kept waiting for the second page")
+        self.assertTrue(loader.running)
+        self.gate.set()
+        self.finished(loader)
+
+    def test_the_rows_on_show_get_their_thumbnails_first(self):
+        self.pages = [[pictured(f"n{at:02}") for at in range(12)]]
+        ids = {node.name: node.id for node in self.pages[0]}
+        with mock.patch.object(ui, "THUMBNAIL_FETCHERS", 1):  # one at a time, so the order can be read
+            loader = self.loader()
+            loader.prefer([ids["n07"], "a tool with no thumbnail", ids["n03"], ids["n11"]])
+            loader.start()
+            self.finished(loader)
+        self.assertEqual(self.fetched[:3], ["n07", "n03", "n11"], "in the order the window has them on show")
+        self.assertEqual(self.fetched[3:], [f"n{at:02}" for at in range(12) if at not in (3, 7, 11)], "then the rest, as listed")
+
+    def test_what_comes_on_show_later_jumps_the_queue(self):
+        self.pages = [[pictured(f"n{at:02}") for at in range(12)]]
+        ids = {node.name: node.id for node in self.pages[0]}
+        self.hold_pictures.clear()
+        with mock.patch.object(ui, "THUMBNAIL_FETCHERS", 1):
+            loader = self.loader()
+            loader.prefer([ids["n05"]])  # what was on show when loading began
+            loader.start()
+            deadline = time.time() + 10
+            while not self.fetched and time.time() < deadline:
+                time.sleep(0.01)
+            loader.prefer([ids["n09"]])  # the list was searched while the first picture was on its way
+            self.hold_pictures.set()
+            self.finished(loader)
+        self.assertEqual(self.fetched[:3], ["n05", "n09", "n00"], "the rows on show now, not the ones that were")
+
+    def test_workflows_come_before_nodes_and_an_accounts_own_nodes_last(self):
+        rain = tools.replace(makes("Rain", "video", source="workflow"), thumbnail_url="https://kaitoi.example/t/rain?token=signed")
+        self.workflows = [rain]
+        self.pages = [[pictured("mine1", "user"), pictured("kaitoi1"), pictured("community1", "community")], [pictured("mine2", "user"), pictured("kaitoi2")]]
+        with mock.patch.object(ui, "THUMBNAIL_FETCHERS", 1):
+            loader = self.loader()
+            loader.start()
+            self.finished(loader)
+        self.assertEqual(self.fetched[0], "Rain")
+        self.assertEqual(sorted(self.fetched[1:4]), ["community1", "kaitoi1", "kaitoi2"], "Kaitoi's and the community's first")
+        self.assertEqual(self.fetched[4:], ["mine1", "mine2"], "an account's own nodes are listed only when asked for")
+
+    def test_from_a_server_that_cannot_make_them_small_node_thumbnails_are_left_and_a_workflows_are_still_asked_for(self):
+        rain = tools.replace(makes("Rain", "video", source="workflow"), thumbnail_url="https://kaitoi.example/t/rain?token=signed")
+        self.workflows = [rain]
+        with mock.patch.object(tools, "renditions_unavailable", lambda: True):
+            loader = self.loader()
+            loader.start()
+            self.finished(loader)
+        self.assertEqual(self.fetched, ["Rain"])
+
+    def test_a_thumbnail_that_cannot_be_fetched_does_not_stop_the_rest(self):
+        def thumbnail(cfg, tool):
+            self.fetched.append(tool.name)
+            if tool.name == "a2":
+                raise RuntimeError("something nobody expected")
+            return f"/pictures/{tool.name}.jpg"
+
+        with mock.patch.object(tools, "fetch_thumbnail", thumbnail), mock.patch.object(ui, "THUMBNAIL_FETCHERS", 1):
+            loader = self.loader()
+            loader.start()
+            self.finished(loader)
+        self.assertEqual(self.fetched, ["a1", "a2", "b1", "b2"])
+        self.assertEqual(sorted(path for _, path in loader.take()["thumbnails"]), ["/pictures/a1.jpg", "/pictures/b1.jpg", "/pictures/b2.jpg"])
+
+    def refusing(self, names, seconds, times=1):
+        """A stand-in for the fetch that is told "not now" for these thumbnails, the first ``times`` each is asked for."""
+        asked, moments = {}, []
+
+        def thumbnail(cfg, tool):
+            moments.append((time.monotonic(), tool.name))
+            asked[tool.name] = asked.get(tool.name, 0) + 1
+            if tool.name in names and asked[tool.name] <= times:
+                raise tools.ComeBackLater(seconds)
+            self.kept.add(tool.name)
+            return f"/pictures/{tool.name}.jpg"
+
+        return mock.patch.object(tools, "fetch_thumbnail", thumbnail), asked, moments
+
+    def test_told_not_now_every_thumbnail_waits_and_the_one_refused_is_asked_for_again(self):
+        self.pages = [[pictured(f"n{at:02}") for at in range(10)]]
+        asked, order, in_a_wait = {}, [], []
+        made = {}
+
+        def thumbnail(cfg, tool):
+            if time.monotonic() < made["loader"]._resume_at:
+                in_a_wait.append(tool.name)  # started although every thread had been told to wait
+            order.append(tool.name)
+            asked[tool.name] = asked.get(tool.name, 0) + 1
+            if tool.name == "n02" and asked[tool.name] == 1:
+                raise tools.ComeBackLater(0.4)
+            return f"/pictures/{tool.name}.jpg"
+
+        with mock.patch.object(tools, "fetch_thumbnail", thumbnail), mock.patch.object(ui, "THUMBNAIL_FETCHERS", 2):
+            loader = made["loader"] = self.loader()
+            began = time.monotonic()
+            loader.start()
+            self.finished(loader)
+        self.assertEqual(asked["n02"], 2, "asked for again after the wait")
+        self.assertEqual(sorted(asked), [f"n{at:02}" for at in range(10)])
+        self.assertEqual(len(loader.take()["thumbnails"]), 10, "and it arrived with the rest")
+        # The other thread may have taken one from the line just before the wait was called; after that, nobody takes any.
+        self.assertLessEqual(len(in_a_wait), 1, "the whole queue waits, not only the picture that was refused")
+        self.assertNotIn("n02", in_a_wait, "least of all the one that was refused")
+        self.assertGreaterEqual(time.monotonic() - began, 0.4, "for as long as Kaitoi asked")
+        self.assertIn("n02", order[-2:], "it went to the end of the line: last, or beside the other thread's last")
+        said = [call.args[0] for call in config.log.call_args_list]
+        self.assertEqual(len([line for line in said if line.startswith("Kaitoi asked for fewer requests: thumbnails wait")]), 1, "said once for the one wait")
+
+    def test_a_server_that_goes_on_saying_not_now_is_not_asked_for_the_rest(self):
+        """The loader would otherwise be at work for as long as that lasts, and while it is the lists cannot be loaded again."""
+        self.pages = [[pictured(f"n{at:02}") for at in range(40)]]
+        stand_in, asked, moments = self.refusing({f"n{at:02}" for at in range(40)}, 0.05, times=99)
+        with stand_in, mock.patch.object(ui, "THUMBNAIL_PATIENCE_SECONDS", 0.12):  # the third wait of 0.05 s is one too many
+            loader = self.loader()
+            began = time.time()
+            loader.start()
+            self.finished(loader)
+        self.assertLess(time.time() - began, 5)
+        self.assertLessEqual(len(moments), ui.THUMBNAIL_FETCHERS * 3, "three rounds of asking, not three for each of the forty")
+        self.assertEqual(loader.take()["thumbnails"], [])
+        said = [call.args[0] for call in config.log.call_args_list]
+        self.assertEqual(len([line for line in said if line.startswith("Kaitoi keeps asking for fewer requests:") and line.endswith("thumbnails are left for the next time the lists load")]), 1)
+        self.assertTrue(loader.take()["nodes"] is None and loader.done, "the lists themselves were loaded and handed over as ever")
+
+    def test_thumbnails_already_on_disk_do_not_pass_for_a_server_that_answers(self):
+        """One kept from last time is handed back without asking Kaitoi anything: it says nothing about whether Kaitoi is still refusing."""
+        self.pages = [[pictured(f"n{at:02}") for at in range(40)]]
+        on_disk = {f"n{at:02}" for at in range(0, 40, 2)}  # every second one, scattered through the line
+        asked = []
+
+        def thumbnail(cfg, tool):
+            if tool.name in on_disk:
+                return f"/pictures/{tool.name}.jpg"
+            asked.append(tool.name)
+            raise tools.ComeBackLater(0.05)
+
+        with mock.patch.object(tools, "fetch_thumbnail", thumbnail), mock.patch.object(tools, "thumbnail_kept", lambda tool: tool.name in on_disk), \
+                mock.patch.object(ui, "THUMBNAIL_PATIENCE_SECONDS", 0.12):
+            loader = self.loader()
+            loader.start()
+            self.finished(loader)
+        self.assertTrue(loader._gave_up)
+        self.assertLessEqual(len(asked), ui.THUMBNAIL_FETCHERS * 3, "given up on after the same three rounds as with nothing on disk")
+        self.assertLessEqual({path for _, path in loader.take()["thumbnails"]}, {f"/pictures/{name}.jpg" for name in on_disk}, "what was on disk is still handed over")
+
+    def test_an_old_thumbnail_handed_back_because_the_new_one_failed_is_not_one_kaitoi_sent(self):
+        """After a week a node's thumbnail is asked for again. When that fails, the old file is handed back: a path, and no sign that the server answers."""
+        self.pages = [[pictured(f"n{at:02}") for at in range(40)]]
+        failing = {f"n{at:02}" for at in range(0, 40, 2)}  # every second one: the server fails these outright, and says "not now" to the rest
+        asked = []
+
+        def thumbnail(cfg, tool):
+            asked.append(tool.name)
+            if tool.name in failing:
+                return f"/pictures/{tool.name}.jpg"  # the stale file from last week; nothing new was written
+            raise tools.ComeBackLater(0.05)
+
+        with mock.patch.object(tools, "fetch_thumbnail", thumbnail), mock.patch.object(ui, "THUMBNAIL_PATIENCE_SECONDS", 0.12), mock.patch.object(ui, "THUMBNAIL_FETCHERS", 1):
+            loader = self.loader()
+            loader.start()
+            self.finished(loader)
+        self.assertTrue(loader._gave_up, "a server that sends nothing is given up on, whatever was on disk")
+        self.assertLessEqual(len([name for name in asked if name not in failing]), 4, "after the same few rounds as ever")
+
+    def test_waits_with_thumbnails_arriving_between_them_do_not_add_up_to_giving_up(self):
+        """A limit that is met now and again, and clears each time, costs only the waits."""
+        self.pages = [[pictured(f"n{at:02}") for at in range(24)]]
+        stand_in, asked, _ = self.refusing({f"n{at:02}" for at in range(0, 24, 3)}, 0.05)  # eight of them told "not now" once each
+        with stand_in, mock.patch.object(ui, "THUMBNAIL_FETCHERS", 1), mock.patch.object(ui, "THUMBNAIL_PATIENCE_SECONDS", 0.12):
+            loader = self.loader()
+            loader.start()
+            self.finished(loader)
+        self.assertEqual(len(loader.take()["thumbnails"]), 24, "eight waits, far more than its patience in all, and every thumbnail arrived")
+        self.assertFalse(loader._gave_up)
+
+    def test_however_short_the_waits_kaitoi_asks_for_it_is_given_time(self):
+        """Told to come back in a second, three refusals in a row are no reason to drop three hundred thumbnails."""
+        loader = self.loader()
+        for at in range(10):
+            loader._resume_at = 0.0  # each a wait of its own
+            loader._come_back(pictured(f"n{at}"), 1)
+        self.assertFalse(loader._gave_up, "ten seconds of waiting is well within its patience")
+        self.assertGreater(ui.THUMBNAIL_PATIENCE_SECONDS, 2 * ui.THUMBNAIL_LONGEST_WAIT_SECONDS, "more than two of the minutes Kaitoi counts over")
+        loader._resume_at = 0.0
+        loader._come_back(pictured("last"), 3600)
+        self.assertFalse(loader._gave_up)
+        loader._resume_at = 0.0
+        loader._come_back(pictured("one too many"), 3600)
+        loader._resume_at = 0.0
+        loader._come_back(pictured("and another"), 3600)
+        self.assertTrue(loader._gave_up, "but not for ever: three of its longest waits with nothing arriving are the end of it")
+
+    def test_no_single_wait_is_longer_than_the_minute_kaitoi_counts_over(self):
+        loader = self.loader()
+        loader._come_back(pictured("slow"), 3600)
+        self.assertLessEqual(loader._resume_at - time.monotonic(), ui.THUMBNAIL_LONGEST_WAIT_SECONDS)
+        self.assertGreater(loader._resume_at - time.monotonic(), ui.THUMBNAIL_LONGEST_WAIT_SECONDS - 5)
+
+    def test_a_node_listed_on_two_pages_has_its_thumbnail_fetched_once(self):
+        twice = pictured("twice")
+        self.pages = [[twice, pictured("a1")], [twice, pictured("b1")]]
+        self.gate.clear()
+        loader = self.loader()
+        loader.start()
+        deadline = time.time() + 10
+        while len(self.fetched) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.1)  # fetched and out of the line by the time the second page names it again
+        self.gate.set()
+        self.finished(loader)
+        self.assertEqual(sorted(self.fetched), ["a1", "b1", "twice"])
+
+    def test_an_accounts_own_nodes_wait_for_the_whole_catalog(self):
+        """A page still to come may bring Kaitoi's own nodes, which go first. One that is on show does not wait."""
+        mine, shown = pictured("mine", "user"), pictured("mine on show", "user")
+        self.pages = [[mine, shown, pictured("kaitoi1")], [pictured("kaitoi2")]]
+        self.gate.clear()
+        with mock.patch.object(ui, "THUMBNAIL_FETCHERS", 1):
+            loader = self.loader()
+            loader.prefer([shown.id])
+            loader.start()
+            deadline = time.time() + 10
+            while len(self.fetched) < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.2)
+            self.assertEqual(self.fetched, ["mine on show", "kaitoi1"], "the second page has not come: the other one of the account's own is not fetched yet")
+            self.gate.set()
+            self.finished(loader)
+        self.assertEqual(self.fetched, ["mine on show", "kaitoi1", "kaitoi2", "mine"])
+
+    def test_a_loader_that_breaks_takes_its_thumbnail_threads_with_it(self):
+        self.pages = [[pictured(f"n{at:02}") for at in range(40)]]
+        self.hold_pictures.clear()
+
+        def broken(cfg, *, should_stop=None, on_page=None):
+            on_page(self.pages[0])
+            deadline = time.time() + 10
+            while self.at_once < ui.THUMBNAIL_FETCHERS and time.time() < deadline:
+                time.sleep(0.01)
+            raise RuntimeError("something nobody expected")
+
+        with mock.patch.object(tools, "load_node_catalog", broken):
+            loader = self.loader()
+            loader.start()
+            time.sleep(0.2)
+            self.assertTrue(loader.running, "at work for as long as a thumbnail is being fetched")
+            self.assertFalse(loader.done)
+            self.hold_pictures.set()
+            self.finished(loader)
+        self.assertEqual([thread.name for thread in threading.enumerate() if thread.name.startswith("kaitoi-thumbnails")], [], "none is left fetching for a loader nobody listens to")
+        self.assertEqual(len(self.fetched), ui.THUMBNAIL_FETCHERS, "only the ones already on their way")
+        self.assertIn("Could not load workflows: something nobody expected", loader.take()["error"])
+
+    def test_a_thumbnail_kaitoi_keeps_saying_not_now_to_is_given_up_on_and_the_loading_ends(self):
+        stand_in, asked, _ = self.refusing({"a2"}, 0.05, times=99)
+        with stand_in:
+            loader = self.loader()
+            loader.start()
+            self.finished(loader)
+        self.assertEqual(asked["a2"], ui.THUMBNAIL_TRIES)
+        self.assertEqual(sorted(path for _, path in loader.take()["thumbnails"]), ["/pictures/a1.jpg", "/pictures/b1.jpg", "/pictures/b2.jpg"])
+        said = [call.args[0] for call in config.log.call_args_list]
+        self.assertIn(f"no thumbnail for 'a2': asked for {ui.THUMBNAIL_TRIES} times", said)
+
+    def test_stopped_during_such_a_wait_it_ends_at_once(self):
+        stand_in, asked, _ = self.refusing({"a1", "a2", "b1", "b2"}, 60)
+        with stand_in:
+            loader = self.loader()
+            loader.start()
+            deadline = time.time() + 10
+            while not asked and time.time() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.2)
+            self.assertTrue(loader.running, "waiting for the minute Kaitoi asked for")
+            began = time.time()
+            loader.stop()
+            self.finished(loader)
+        self.assertLess(time.time() - began, 2)
+
+    def test_stopped_it_fetches_nothing_more_and_ends(self):
+        self.pages = [[pictured(f"n{at:02}") for at in range(40)], [pictured("later")]]
+        self.gate.clear()
+        self.hold_pictures.clear()
+        loader = self.loader()
+        loader.start()
+        deadline = time.time() + 10
+        while self.at_once < ui.THUMBNAIL_FETCHERS and time.time() < deadline:
+            time.sleep(0.01)
+        loader.stop()
+        self.hold_pictures.set()
+        self.gate.set()
+        self.finished(loader)
+        self.assertEqual(len(self.fetched), ui.THUMBNAIL_FETCHERS, "only the ones already on their way")
+        self.assertFalse(loader.take()["nodes_complete"])
+
+    def test_how_long_each_part_took_is_written_to_the_log(self):
+        loader = self.loader()
+        loader.start()
+        self.finished(loader)
+        said = [call.args[0] for call in config.log.call_args_list]
+        for wanted in (r"0 workflows after \d+\.\d s", r"first 2 nodes after \d+\.\d s", r"4 nodes after \d+\.\d s", r"4 thumbnails after \d+\.\d s"):
+            self.assertEqual(len([line for line in said if re.fullmatch(wanted, line)]), 1, wanted)
+
+
+class NodesAsTheyArrive(Base):
+    """The window, handed the node catalog a page at a time."""
+
+    def setUp(self):
+        super().setUp()
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        kept = mock.patch.object(config, "APP_DIR", self.dir.name)
+        kept.start(); self.addCleanup(kept.stop)
+        self.saved = {}
+
+        def update(**changes):
+            self.saved.update(changes)
+            return dict(self.saved)
+
+        for patcher in (mock.patch.object(config, "update", side_effect=update), mock.patch.object(ui.Panel, "_picture", lambda self, tool: ""),
+                        mock.patch.object(ui.Panel, "_update_install_all", lambda self: None), mock.patch.object(ui.Panel, "_relayout", lambda self: None),
+                        mock.patch.object(ui.Panel, "_want_state", lambda self, tool: None), mock.patch.object(ui.Panel, "_show_thumbnail", lambda self, tool: None),
+                        mock.patch.object(ui.Panel, "_sends_line", lambda self: "")):
+            patcher.start(); self.addCleanup(patcher.stop)
+        self.made = made = panel(settings={"api_key": "k", "base_url": "http://kaitoi.example"}, width=440)
+        self.saved.update(made.settings)
+        made.catalog = ui.NODES
+        made._chosen, made.rebuilds, made.balance, made.load_error = {}, 0, "", ""
+        made.items["Tools"] = Tree()
+        for box in ("OriginBuiltin", "OriginCommunity", "OriginUser"):
+            made.items[box].Checked = True
+        self.stored = []
+        stored = mock.patch.object(tools, "write_nodes", lambda base, account, nodes, with_pins=True: self.stored.append([node.name for node in nodes]))
+        stored.start(); self.addCleanup(stored.stop)
+
+    def arrive(self, nodes, complete):
+        self.made.loader = FinishedLoader(nodes=nodes, nodes_complete=complete)
+        self.made._collect_loader()
+
+    def names(self):
+        return sorted(node.name for node in self.made.node_tools)
+
+    def test_the_first_page_is_listed_at_once_on_a_computer_that_had_no_list(self):
+        self.arrive([makes("Blur", "image"), makes("Upscale", "image")], complete=False)
+        self.assertEqual(self.names(), ["Blur", "Upscale"])
+        self.assertEqual(sorted(self.made.items["Tools"].rows()), ["Blur", "Upscale"], "drawn, not only known")
+        self.assertEqual(self.stored, [], "half a catalog is not what is kept for next time")
+        self.arrive([makes("Blur", "image"), makes("Upscale", "image"), makes("Speak", "audio")], complete=True)
+        self.assertEqual(self.names(), ["Blur", "Speak", "Upscale"])
+        self.assertEqual(self.stored, [["Blur", "Upscale", "Speak"]], "the whole of it is, once")
+
+    def test_a_page_takes_nothing_off_the_list_kept_from_last_time(self):
+        self.made.node_tools = [makes("Blur", "image"), makes("Gone since", "image"), makes("Speak", "audio")]
+        renamed = tools.replace(makes("Blur", "image"), description="Now with a description.")
+        self.arrive([renamed, makes("New", "image")], complete=False)
+        self.assertEqual(self.names(), ["Blur", "Gone since", "New", "Speak"], "the nodes of the pages still to come stay listed meanwhile")
+        self.assertEqual(next(node for node in self.made.node_tools if node.name == "Blur").description, "Now with a description.", "and what arrived is the newer word on a node")
+        self.arrive([renamed, makes("New", "image"), makes("Speak", "audio")], complete=True)
+        self.assertEqual(self.names(), ["Blur", "New", "Speak"], "only the whole catalog says what is no longer there")
+
+    def test_a_node_already_opened_keeps_its_inputs_through_every_page(self):
+        opened = speak()
+        self.assertTrue(opened.ready)
+        summary = tools.replace(opened, inputs=(), outputs=(), ready=False)
+        self.made.node_tools = [opened]
+        for complete in (False, True):
+            self.arrive([summary, makes("Blur", "image")], complete=complete)
+            kept = next(node for node in self.made.node_tools if node.id == opened.id)
+            self.assertTrue(kept.ready, complete)
+            self.assertEqual(kept.inputs, opened.inputs)
+
+    def test_a_thumbnail_that_arrives_is_put_on_its_row_without_redrawing_the_list(self):
+        """While the lists load thumbnails come in all the time, and every page of nodes asks for the list again."""
+        made = self.made
+        blur, speak_node = makes("Blur", "image"), makes("Speak", "audio")
+        made.node_tools = [blur, speak_node]
+        pictures = {}
+        with mock.patch.object(ui.Panel, "_picture", lambda panel, tool: pictures.get(tool.id, "icon.png")):
+            made._rebuild_list()
+            drawn = made.rebuilds
+            row = made._tool_items[blur.id]
+            self.assertEqual(row.Icon[0], "icon.png")
+            pictures[blur.id] = "/thumbnails/blur.jpg"  # fetched since
+            made._rebuild_list()
+            self.assertEqual(made.rebuilds, drawn, "the rows are the same rows: nothing is redrawn")
+            self.assertIs(made._tool_items[blur.id], row)
+            self.assertEqual(row.Icon[0], "/thumbnails/blur.jpg", "the one row gets its picture where it is")
+            self.assertEqual(made._tool_items[speak_node.id].Icon[0], "icon.png")
+            with mock.patch.object(ui.Panel, "_set_item_icon", side_effect=AssertionError("a picture was put on a row again")):
+                made._rebuild_list()
+            self.assertEqual(made.rebuilds, drawn, "and that is remembered: asked again, there is nothing to do")
+            # Anything else about a row is a redraw, as before.
+            made.node_tools = [blur, speak_node, makes("Upscale", "image")]
+            made._rebuild_list()
+            self.assertEqual(made.rebuilds, drawn + 1)
+            self.assertEqual(made._tool_items[blur.id].Icon[0], "/thumbnails/blur.jpg")
+
+    def test_only_a_change_of_pictures_alone_is_made_in_place(self):
+        rows = (("IMAGE", (("node:a", "A", "Image", "icon.png", "none"), ("node:b", "B", "Image", "icon.png", "none"))), ("AUDIO", (("node:c", "C", "Audio", "icon.png", "none"),)))
+
+        def with_row(category, at, **changed):
+            names = ("id", "name", "task", "picture", "state")
+            return tuple((label, tuple(tuple(changed.get(name, value) for name, value in zip(names, row)) if (label, index) == (category, at) else row for index, row in enumerate(members)))
+                         for label, members in rows)
+
+        changed = ui.Panel._pictures_changed
+        self.assertEqual(changed(rows, with_row("IMAGE", 1, picture="b.jpg")), [("node:b", "b.jpg")])
+        self.assertEqual(changed(rows, rows), [])
+        self.assertIsNone(changed(None, rows), "nothing is drawn yet")
+        for what, other in (("a name", with_row("IMAGE", 0, name="A2", picture="a.jpg")), ("what it makes", with_row("AUDIO", 0, task="Speech")), ("whether it is in Resolve", with_row("IMAGE", 0, state="ready")),
+                            ("which node the row is", with_row("IMAGE", 0, id="node:z")), ("a row more", (rows[0], (rows[1][0], rows[1][1] * 2))), ("a heading", (("PICTURES", rows[0][1]), rows[1])),
+                            ("a heading fewer", rows[:1])):
+            self.assertIsNone(changed(rows, other), what)
+
+    def test_what_a_loader_finished_with_while_the_window_was_busy_is_still_taken(self):
+        """The window looks, works on what it took, and only then would have asked whether the loader had ended."""
+        class EndsBetweenLooks:
+            started, done, running = 0.0, False, True
+            preferred: list = []
+
+            def __init__(self, pages):
+                self.pages = list(pages)
+
+            def take(self):
+                nodes, complete = self.pages.pop(0) if self.pages else (None, False)
+                if len(self.pages) == 1:
+                    self.done, self.running = True, False  # the last page arrives, and it ends, while this page is being drawn
+                return {"tools": None, "snapshot": None, "error": None, "balance": None, "nodes": nodes, "nodes_complete": complete, "thumbnails": []}
+
+            def prefer(self, tool_ids):
+                self.preferred = list(tool_ids)
+
+            def stop(self):
+                pass
+
+        made = self.made
+        first, whole = [makes("Blur", "image")], [makes("Blur", "image"), makes("Speak", "audio")]
+        made.loader = EndsBetweenLooks([(first, False), (whole, True)])
+        self.assertTrue(made._collect_loader(), "it had not ended when the window looked: it is kept for one more look")
+        self.assertIsNotNone(made.loader)
+        self.assertEqual(self.names(), ["Blur"])
+        self.assertFalse(made._collect_loader())
+        self.assertIsNone(made.loader)
+        self.assertEqual(self.names(), ["Blur", "Speak"], "the last page is listed")
+        self.assertEqual(self.stored, [["Blur", "Speak"]], "and the whole catalog is kept for next time")
+
+    def test_a_page_of_nodes_does_not_lay_an_open_form_out_again(self):
+        """A load starts after every run, when someone is likely typing the next prompt."""
+        made = self.made
+        blur = makes("Blur", "image")
+        made.node_tools = [blur, makes("Speak", "audio")]
+        made._rebuild_list()
+        made.tool = blur
+        with mock.patch.object(ui.Panel, "_select_tool") as chosen:
+            self.arrive([makes("Blur", "image"), makes("New", "image")], complete=False)
+            chosen.assert_not_called()
+            self.arrive([tools.replace(makes("Blur", "image"), description="Changed since."), makes("New", "image")], complete=False)
+            chosen.assert_called_once_with(blur.id)  # the chosen node itself is another now
+            chosen.reset_mock()
+            self.arrive([tools.replace(makes("Blur", "image"), description="Changed since."), makes("New", "image")], complete=True)
+            chosen.assert_called_once_with(blur.id)  # and once when the catalog is whole, as before
+
+    def test_the_node_used_last_time_is_chosen_when_its_page_arrives(self):
+        made = self.made
+        made.settings["last_tool"] = "node:Speak"
+        self.arrive([makes("Blur", "image"), makes("Upscale", "image")], complete=False)
+        self.assertEqual(made.tool.name, "Blur", "nothing else is there yet: the first row")
+        self.arrive([makes("Blur", "image"), makes("Upscale", "image"), makes("Speak", "audio")], complete=False)
+        self.assertEqual(made.tool.name, "Speak", "the first row was the list's choice, not the user's")
+        self.assertEqual(made._chosen_for_them, "", "and this one is theirs: the node they used last time")
+        self.arrive([makes("Blur", "image"), makes("Upscale", "image"), makes("Speak", "audio"), makes("Last", "image")], complete=True)
+        self.assertEqual(made.tool.name, "Speak")
+
+    def test_the_lists_own_choice_stays_the_lists_until_the_node_used_last_time_arrives(self):
+        made = self.made
+        made.settings["last_tool"] = "node:Speak"
+        self.arrive([makes("Blur", "image")], complete=False)
+        self.arrive([makes("Blur", "image"), makes("Upscale", "image")], complete=False)
+        self.arrive([tools.replace(makes("Blur", "image"), description="Changed since."), makes("Upscale", "image")], complete=False)  # chosen again by the window itself
+        self.assertEqual((made.tool.name, made._chosen_for_them), ("Blur", "node:Blur"))
+        self.arrive([makes("Blur", "image"), makes("Upscale", "image"), makes("Speak", "audio")], complete=True)
+        self.assertEqual(made.tool.name, "Speak", "on the last page, three pages after the list made its choice")
+
+    def test_a_row_the_user_chose_meanwhile_is_not_taken_from_them(self):
+        made = self.made
+        made.settings["last_tool"] = "node:Speak"
+        self.arrive([makes("Blur", "image"), makes("Upscale", "image")], complete=False)
+        made._select_tool("node:Upscale")  # clicked while the rest was loading
+        self.arrive([makes("Blur", "image"), makes("Upscale", "image"), makes("Speak", "audio")], complete=True)
+        self.assertEqual(made.tool.name, "Upscale")
+
+    def test_a_click_on_the_row_the_list_had_chosen_makes_it_the_users_choice(self):
+        """Their form may be open on it, and Run pressed the next moment: no page of nodes may put another node in its place."""
+        made = self.made
+        made.settings["last_tool"] = "node:Speak"
+        three = [makes("Blur", "image"), makes("Upscale", "image"), makes("Speak", "audio")]
+        # As the window starts with a list kept from last time: the list draws itself, then the node used last time is chosen.
+        made.node_tools = list(three)
+        made._rebuild_show_filter()
+        made._rebuild_list()
+        made._select_tool("node:Speak")
+        self.assertEqual((made.tool.name, made._chosen_for_them), ("Speak", ""), "chosen because it was used last time, not by the list")
+        made.items["Tools"].CurrentItem = lambda: made._tool_items["node:Blur"]
+        made._on_tool_picked()  # the user clicks the first row
+        self.assertEqual(made.tool.name, "Blur")
+        for complete in (False, True):
+            self.arrive(list(three), complete=complete)
+            self.assertEqual(made.tool.name, "Blur", complete)
+
+    def test_a_click_on_the_first_row_while_it_is_the_lists_own_choice_is_respected_too(self):
+        made = self.made
+        made.settings["last_tool"] = "node:Speak"
+        self.arrive([makes("Blur", "image"), makes("Upscale", "image")], complete=False)
+        self.assertEqual((made.tool.name, made._chosen_for_them), ("Blur", "node:Blur"))
+        made.items["Tools"].CurrentItem = lambda: made._tool_items["node:Blur"]
+        made._on_tool_picked()  # the same row the list had chosen: theirs from here on
+        self.arrive([makes("Blur", "image"), makes("Upscale", "image"), makes("Speak", "audio")], complete=False)
+        self.assertEqual(made.tool.name, "Blur")
+
+    def test_a_node_that_was_listed_all_along_is_not_one_that_has_just_arrived(self):
+        """The choice moves to the node used last time only on the page that brings it, never on a later one."""
+        made = self.made
+        made.settings["last_tool"] = "node:Speak"
+        three = [makes("Blur", "image"), makes("Upscale", "image"), makes("Speak", "audio")]
+        made.node_tools = list(three)
+        made._rebuild_list()
+        made.tool, made._chosen_for_them = three[0], "node:Blur"  # however that came about
+        for complete in (False, True):
+            self.arrive(list(three), complete=complete)
+            self.assertEqual(made.tool.name, "Blur", complete)
+
+    def test_a_node_whose_form_was_opened_stays_theirs_after_they_go_back(self):
+        made = self.made
+        made.settings["last_tool"] = "node:Speak"
+        self.arrive([makes("Blur", "image"), makes("Upscale", "image")], complete=False)
+        self.assertEqual(made._chosen_for_them, "node:Blur")
+        with mock.patch.object(ui.Panel, "_show_run", lambda panel, *a, **k: None), mock.patch.object(ui.Panel, "_set_view", lambda panel, view: setattr(panel, "view", view)), \
+                mock.patch.object(ui.Panel, "_retry_state_on_pick", lambda panel, tool: None):
+            made._open_run()
+            made._set_view(ui.VIEW_BROWSE)  # Back
+            self.arrive([makes("Blur", "image"), makes("Upscale", "image"), makes("Speak", "audio")], complete=False)
+        self.assertEqual(made.tool.name, "Blur", "they opened its form: it was theirs from then on")
+
+    def test_a_node_acted_on_from_its_card_stays_theirs(self):
+        """Starred, installed or used: the card must not turn into another node's the moment after."""
+        for act in ("_toggle_favorite", "_toggle_install", "_use"):
+            with self.subTest(act):
+                made = self.made = panel(settings={"api_key": "k", "base_url": "http://kaitoi.example", "last_tool": "node:Speak"}, width=440)
+                made.catalog = ui.NODES
+                made._chosen, made.rebuilds, made.balance, made.load_error = {}, 0, "", ""
+                made.items["Tools"] = Tree()
+                for box in ("OriginBuiltin", "OriginCommunity", "OriginUser"):
+                    made.items[box].Checked = True
+                self.arrive([makes("Blur", "image"), makes("Upscale", "image")], complete=False)
+                self.assertEqual(made._chosen_for_them, "node:Blur")
+                try:
+                    getattr(made, act)()  # whatever it goes on to do, or fails to do without Resolve
+                except Exception:  # noqa: BLE001
+                    pass
+                self.assertEqual(made._chosen_for_them, "", "acting on it is choosing it")
+                self.arrive([makes("Blur", "image"), makes("Upscale", "image"), makes("Speak", "audio")], complete=False)
+                self.assertEqual(made.tool.name, "Blur")
+
+    def test_a_form_that_is_open_is_never_given_another_node(self):
+        made = self.made
+        made.settings["last_tool"] = "node:Speak"
+        self.arrive([makes("Blur", "image"), makes("Upscale", "image")], complete=False)
+        with mock.patch.object(ui.Panel, "_show_run", lambda panel, *a, **k: None), mock.patch.object(ui.Panel, "_set_view", lambda panel, view: setattr(panel, "view", view)), \
+                mock.patch.object(ui.Panel, "_retry_state_on_pick", lambda panel, tool: None):
+            made._open_run()
+            self.assertEqual(made.view, ui.VIEW_RUN)
+            self.arrive([makes("Blur", "image"), makes("Upscale", "image"), makes("Speak", "audio")], complete=True)
+        self.assertEqual(made.tool.name, "Blur")
+        # Even with the mark still set, an open form is reason enough.
+        made._chosen_for_them, made.view = "node:Blur", ui.VIEW_RUN
+        made.node_tools = [makes("Blur", "image")]
+        with mock.patch.object(ui.Panel, "_show_run", lambda panel, *a, **k: None):
+            self.arrive([makes("Blur", "image"), makes("Speak", "audio")], complete=False)
+        self.assertEqual(made.tool.name, "Blur")
+
+    def test_the_show_filter_is_refilled_only_when_its_entries_change(self):
+        """Refilled, it tells the window its choice changed, and the list of tools is drawn again for each."""
+        made = self.made
+
+        class Counting(Widget):
+            def __init__(self):
+                super().__init__("Show")
+                object.__setattr__(self, "cleared", 0)
+
+            def Clear(self):
+                object.__setattr__(self, "cleared", self.cleared + 1)
+                super().Clear()
+
+        made.items["Show"] = combo = Counting()
+        self.arrive([makes("Blur", "image", category="Image")], complete=False)
+        self.assertEqual((combo.cleared, combo._entries), (1, ["All categories", "Image"]))
+        self.arrive([makes("Blur", "image", category="Image"), makes("Sharpen", "image", category="Image")], complete=False)
+        self.assertEqual(combo.cleared, 1, "a page with no new category leaves it as it is")
+        self.arrive([makes("Blur", "image", category="Image"), makes("Sharpen", "image", category="Image"), makes("Speak", "audio", category="Audio")], complete=True)
+        self.assertEqual((combo.cleared, combo._entries), (2, ["All categories", "Audio", "Image"]))
+        made.catalog = ui.WORKFLOWS
+        made._rebuild_show_filter()
+        self.assertEqual((combo.cleared, combo._entries), (3, ["Every task"]), "the other tab has other entries")
+
+    def test_a_loader_started_later_is_told_the_rows_already_on_show(self):
+        made = self.made
+        made.node_tools = [makes("Blur", "image"), makes("Speak", "audio")]
+        made._rebuild_list()
+        started = []
+
+        class Started(FinishedLoader):
+            running = False
+
+            def __init__(self, cfg, known):
+                super().__init__()
+                started.append(self)
+
+            def start(self):
+                self.was_told = list(self.preferred)  # before it begins to fetch anything
+
+        with mock.patch.object(ui, "Loader", Started), mock.patch.object(tools, "read_snapshot", lambda base, account: None):
+            made.loader = None
+            made.reload_workflows(quiet=True)
+        self.assertEqual(len(started), 1)
+        self.assertEqual(sorted(started[0].was_told), sorted(node.id for node in made.node_tools))
+
+    def test_the_loader_is_told_which_rows_are_on_show_even_when_nothing_is_redrawn(self):
+        made = self.made
+        made.node_tools = [makes("Blur", "image"), makes("Speak", "audio")]
+        made.loader = FinishedLoader()
+        made._rebuild_list()
+        self.assertEqual(sorted(made.loader.preferred), sorted(node.id for node in made.node_tools))
+        self.assertEqual(made._on_show, made.loader.preferred)
+        made.loader = FinishedLoader()  # a loader started later, the list unchanged
+        rebuilds = made.rebuilds
+        made._rebuild_list()
+        self.assertEqual(made.rebuilds, rebuilds, "the same rows: nothing was redrawn")
+        self.assertEqual(sorted(made.loader.preferred), sorted(node.id for node in made.node_tools), "and the new loader knows them all the same")
+        self.assertEqual(made.loader.preferred[0], made.tool.id, "the node whose card is open first: its picture is the big one")
+
+
 class Uninstalling(Base):
     """The Uninstall button: what the window does around the uninstaller, which is stood in for here."""
 
@@ -2048,14 +2832,8 @@ class WhoseListsAreShown(Base):
             made._account_switched(before)
 
     def test_a_node_list_that_arrives_is_stored_for_the_account_that_asked(self):
-        class Arrived(FinishedLoader):
-            def take(self):
-                fresh = super().take()
-                fresh["nodes"] = [makes("Bob node", "image")]
-                return fresh
-
         made = panel(settings={"api_key": "bob-key", "base_url": self.server})
-        made.loader = Arrived()
+        made.loader = FinishedLoader(nodes=[makes("Bob node", "image")])
         made._chosen = {}
         with mock.patch.object(ui.Panel, "_rebuild_list", lambda panel: None), mock.patch.object(ui.Panel, "_rebuild_show_filter", lambda panel: None), \
                 mock.patch.object(ui.Panel, "_select_tool", lambda panel, keep: None):

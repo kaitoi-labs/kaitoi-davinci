@@ -103,6 +103,8 @@ class FakeKaitoi(ThreadingHTTPServer):
         self.thumbnail_bytes = fake_jpeg(256, 144)  # the small JPEG a current server makes
         self.thumbnail_png = b""  # the same picture as a PNG, when a test needs one
         self.png_status = None  # a status to refuse every request for a PNG with
+        self.thumbnails_too_many = 0  # how many thumbnail requests to answer "too many requests, come back in 7 s" first
+        self.node_thumbnails = False  # True: every node in the list has a thumbnail, as most of Kaitoi's own do
         self.thumbnail_broken = False  # True: a reply that stops making sense part way
         self.stored_thumbnail = b"\x89PNG\r\n\x1a\n" + b"P" * 4000  # what the author uploaded
         self.initial_state = "ok"  # "ok", "fails" (the node cannot start) or "missing" (a server from before this existed)
@@ -211,6 +213,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b"zz\r\nnot a chunk\r\n")
                 return None
+            if self.server.thumbnails_too_many > 0:
+                self.server.thumbnails_too_many -= 1
+                return self._send(429, {"error": {"code": "RATE_LIMITED", "message": "Too many requests."}}, {"Retry-After": "7"})
             if self.server.png_status and query.get("format") == ["png"]:
                 return self._send(self.server.png_status, {"error": {"code": "THUMBNAIL_NOT_RENDERABLE", "message": "no"}})
             if self.server.renders_thumbnails and query.get("format") == ["jpeg"] and query.get("size"):
@@ -237,6 +242,8 @@ class _Handler(BaseHTTPRequestHandler):
                 error = {"code": "INVALID_FIELDS_PROJECTION", "message": "fields must be a non-empty comma-separated list of supported fields."}
                 return self._send(400, {"error": error})
             items = [{k: v for k, v in node.items() if wants_pins or k not in ("inputs", "outputs")} for node in NODE_DETAILS.values()]
+            if self.server.node_thumbnails:
+                items = [{**node, "thumbnailUrl": f"{self.server.url}/api/v1/node-type-thumbnails/{node['type']}?token=signed"} for node in items]
             cursor = int(query.get("cursor", ["0"])[0])
             page = items[cursor:cursor + 2]
             more = cursor + 2 < len(items)

@@ -600,16 +600,23 @@ def load_node_patiently(
     return None
 
 
-def load_node_catalog(cfg: api.Config, *, should_stop: Callable[[], bool] | None = None) -> list:
+def load_node_catalog(cfg: api.Config, *, should_stop: Callable[[], bool] | None = None, on_page: Callable[[list], None] | None = None) -> list:
     """Every node the account can use: with its pins from a current server,
     unloaded from an older one. The plain loaders are left out: on their own
-    they only hand back the file they were given."""
-    nodes = []
-    for summary in api.list_node_types(cfg, should_stop=should_stop):
-        node_type = str(summary.get("type") or "")
-        if not node_type or "/loaders/" in node_type:
-            continue
-        nodes.append(node_from_summary(summary))
+    they only hand back the file they were given.
+
+    ``on_page`` is handed the nodes of each page of the catalog as it
+    arrives, so they can be listed before the last page is in."""
+
+    nodes: list = []
+
+    def take(summaries) -> None:
+        page = [node_from_summary(summary) for summary in summaries if str(summary.get("type") or "") and "/loaders/" not in str(summary.get("type"))]
+        nodes.extend(page)
+        if on_page is not None:
+            on_page(page)
+
+    api.list_node_types(cfg, should_stop=should_stop, on_page=take)
     return nodes
 
 
@@ -1050,6 +1057,21 @@ _tiles_tried: set = set()  # cuts asked for this session, whatever came of it
 _tiles_refused = 0  # times, since the plugin started, a request for a PNG was answered with something else
 
 
+class ComeBackLater(Exception):
+    """Kaitoi answered "not now" to a thumbnail: too many requests from this
+    address within a minute (429), or too many thumbnails being made at once
+    (503). The picture is not refused. It is to be asked for again, no sooner
+    than ``seconds`` from now."""
+
+    def __init__(self, seconds: float) -> None:
+        super().__init__(f"asked to come back in {seconds} s")
+        self.seconds = seconds
+
+
+def _not_now(exc: api.KaitoiAPIError) -> bool:
+    return exc.status in (429, 503)
+
+
 def renditions_unavailable() -> bool:
     """Is this a server from before thumbnails could be made small? After a
     few stored files there is no point asking for the rest."""
@@ -1116,7 +1138,8 @@ def _remove_quietly(*paths: str) -> None:
 def _fetch_tile(tool: Tool, fresh: bool = False) -> None:
     """A thumbnail that is not 16:9 is fetched once more as a PNG and cut to
     that shape, so it can sit in a list row like the others. Failing here
-    only means the tool keeps its icon; nothing raised here leaves.
+    only means the tool keeps its icon; the one thing raised from here is
+    :class:`ComeBackLater`, when Kaitoi asks for fewer requests.
 
     ``fresh``: the thumbnail itself was just replaced, so the cut on disk, or
     the note that there is none, is of another picture."""
@@ -1153,10 +1176,13 @@ def _fetch_tile(tool: Tool, fresh: bool = False) -> None:
             os.replace(partial, cut)
             _remove_quietly(refused_note)
     except api.KaitoiAPIError as exc:
+        if _not_now(exc):
+            _tiles_tried.discard(cut)  # not tried, as far as the next asking goes
+            raise ComeBackLater(_retry_wait(exc.details)) from exc
         if exc.code == "TOO_LARGE":
             _tiles_refused += 1
             refused = True
-        elif 400 <= exc.status < 500 and exc.status not in (401, 403, 408, 429):
+        elif 400 <= exc.status < 500 and exc.status not in (401, 403, 408):
             # This picture cannot be made smaller; asking again changes nothing.
             # A link that has run out (401, 403) is another matter: the next
             # start gets a new one.
@@ -1216,6 +1242,18 @@ def drop_replaced_thumbnails(workflows: list) -> int:
     return removed
 
 
+def thumbnail_kept(tool: Tool) -> bool:
+    """Is the tool's thumbnail on disk and still good, so that
+    :func:`fetch_thumbnail` will hand it back without asking Kaitoi for it?
+    A workflow's file is named for its date; a node's is good for a week."""
+    target = thumbnail_path(tool)
+    try:
+        have = os.path.isfile(target) and os.path.getsize(target) > 0
+        return bool(have and (tool.updated_at or time.time() - os.path.getmtime(target) < THUMBNAIL_KEEP_SECONDS))
+    except OSError:
+        return False
+
+
 def fetch_thumbnail(cfg: api.Config, tool: Tool) -> str | None:
     """Download the tool's thumbnail once; returns its path, or None.
 
@@ -1225,12 +1263,16 @@ def fetch_thumbnail(cfg: api.Config, tool: Tool) -> str | None:
     that is told apart by what arrives, and is not kept.
 
     The link is signed and is its own permission: the API key is not sent.
+
+    Raises :class:`ComeBackLater` when Kaitoi asks for fewer requests: the
+    picture, or its cut for the list, is then asked for again by calling
+    this once more after the wait.
     """
     if not tool.thumbnail_url:
         return None
     target = thumbnail_path(tool)
     have = os.path.isfile(target) and os.path.getsize(target) > 0
-    if have and (tool.updated_at or time.time() - os.path.getmtime(target) < THUMBNAIL_KEEP_SECONDS):
+    if thumbnail_kept(tool):
         _fetch_tile(tool)  # a picture kept from before the lists could show one of its shape
         return target  # a workflow's file is named for its date; a node's is good for a week
     if tool.id in _thumbnails_refused:
@@ -1250,6 +1292,8 @@ def fetch_thumbnail(cfg: api.Config, tool: Tool) -> str | None:
         os.chmod(target, 0o644)  # Resolve creates files anyone may write
         _fetch_tile(tool, fresh=True)
     except api.KaitoiAPIError as exc:
+        if _not_now(exc):
+            raise ComeBackLater(_retry_wait(exc.details)) from exc
         _thumbnails_refused.add(tool.id)
         if exc.code == "TOO_LARGE":
             _renditions_refused += 1
